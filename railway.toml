@@ -1,0 +1,18 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "npm start"
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+# Scale to zero when idle (costs $0 when no migrations running)
+[scaling]
+minReplicas = 0
+maxReplicas = 1
+
+# Auto-start when HTTP request received
+[autoscaling]
+enabled = true

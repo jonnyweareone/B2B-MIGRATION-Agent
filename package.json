@@ -1,0 +1,36 @@
+{
+  "name": "soniq-migration-worker",
+  "version": "1.0.0",
+  "description": "Scale-to-zero B2B migration worker for SONIQ Mail",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "keywords": ["migration", "bull", "redis", "microsoft365", "google-workspace"],
+  "author": "Guardian Network Solutions",
+  "license": "PROPRIETARY",
+  "dependencies": {
+    "express": "^4.18.2",
+    "bull": "^4.12.2",
+    "ioredis": "^5.3.2",
+    "@supabase/supabase-js": "^2.39.3",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "winston": "^3.11.0",
+    "dotenv": "^16.4.1",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/bull": "^4.10.0",
+    "@types/cors": "^2.8.17",
+    "@types/node": "^20.11.5",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
