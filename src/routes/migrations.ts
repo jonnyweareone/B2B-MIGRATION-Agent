@@ -102,14 +102,18 @@ router.get('/:id/status', async (req, res) => {
     }
 
     // Get Bull queue stats for this migration
-    const jobs = await migrationQueue.getJobs(['waiting', 'active', 'completed', 'failed']);
-    const relatedJobs = jobs.filter((j) => j.data.migrationJobId === id);
+    const [waitingJobs, activeJobs, completedJobs, failedJobs] = await Promise.all([
+      migrationQueue.getJobs(['waiting']),
+      migrationQueue.getJobs(['active']),
+      migrationQueue.getJobs(['completed']),
+      migrationQueue.getJobs(['failed']),
+    ]);
 
     const queueStats = {
-      waiting: relatedJobs.filter((j) => j.getState() === 'waiting').length,
-      active: relatedJobs.filter((j) => j.getState() === 'active').length,
-      completed: relatedJobs.filter((j) => j.getState() === 'completed').length,
-      failed: relatedJobs.filter((j) => j.getState() === 'failed').length,
+      waiting: waitingJobs.filter((j) => j.data.migrationJobId === id).length,
+      active: activeJobs.filter((j) => j.data.migrationJobId === id).length,
+      completed: completedJobs.filter((j) => j.data.migrationJobId === id).length,
+      failed: failedJobs.filter((j) => j.data.migrationJobId === id).length,
     };
 
     res.json({
