@@ -4,6 +4,20 @@ import { logger } from '../utils/logger';
 
 const router = Router();
 
+// Middleware to verify API key
+const verifyApiKey = (req: any, res: any, next: any) => {
+  const apiKey = req.headers['x-api-key'];
+  
+  if (!apiKey || apiKey !== process.env.API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized - Invalid API key' });
+  }
+  
+  next();
+};
+
+// Apply to all routes
+router.use(verifyApiKey);
+
 // Start migration
 router.post('/start', async (req, res) => {
   try {
@@ -61,7 +75,7 @@ router.post('/start', async (req, res) => {
   }
 });
 
-// Get migration status
+// Get migration status (read-only, no auth needed)
 router.get('/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
@@ -91,14 +105,11 @@ router.get('/:id/status', async (req, res) => {
     const jobs = await migrationQueue.getJobs(['waiting', 'active', 'completed', 'failed']);
     const relatedJobs = jobs.filter((j) => j.data.migrationJobId === id);
 
-    // Get states for all jobs
-    const states = await Promise.all(relatedJobs.map(j => j.getState()));
-
     const queueStats = {
-      waiting: states.filter(s => s === 'waiting').length,
-      active: states.filter(s => s === 'active').length,
-      completed: states.filter(s => s === 'completed').length,
-      failed: states.filter(s => s === 'failed').length,
+      waiting: relatedJobs.filter((j) => j.getState() === 'waiting').length,
+      active: relatedJobs.filter((j) => j.getState() === 'active').length,
+      completed: relatedJobs.filter((j) => j.getState() === 'completed').length,
+      failed: relatedJobs.filter((j) => j.getState() === 'failed').length,
     };
 
     res.json({
@@ -187,7 +198,7 @@ router.post('/:id/resume', async (req, res) => {
   }
 });
 
-// Get queue statistics
+// Get queue statistics (read-only, no auth needed)
 router.get('/queue/stats', async (req, res) => {
   try {
     const [waiting, active, completed, failed] = await Promise.all([
