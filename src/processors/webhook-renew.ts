@@ -32,7 +32,7 @@ export async function webhookRenewProcessor(job: Job<WebhookRenewJobData>) {
       throw new Error(`Webhook renewal failed: ${response.status} ${errorText}`);
     }
 
-    const result = await response.json();
+    const result = await response.json() as { renewed: number; failed: number; results: any[] };
 
     logger.info('✅ Webhook renewal completed', {
       renewed: result.renewed,
