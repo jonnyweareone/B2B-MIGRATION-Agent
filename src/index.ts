@@ -5,13 +5,14 @@ import Redis from 'ioredis';
 import { createClient } from '@supabase/supabase-js';
 import { logger } from './utils/logger';
 import migrationRoutes from './routes/migrations';
+import bicomRoutes from './routes/bicom';
 import * as dotenv from 'dotenv';
 
 // Load environment variables
 dotenv.config();
 
 // Environment variables
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || '3000');
 const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379');
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -66,12 +67,14 @@ import { discoveryProcessor } from './processors/discovery';
 import { mailSyncProcessor } from './processors/mail-sync';
 import { calendarSyncProcessor } from './processors/calendar-sync';
 import { catchupProcessor } from './processors/catchup';
+import { bicomMigrationProcessor } from './processors/bicom-migration';
 
 // Register processors with concurrency limits
 migrationQueue.process('discovery', 1, discoveryProcessor);
 migrationQueue.process('mail-sync', 5, mailSyncProcessor);
 migrationQueue.process('calendar-sync', 5, calendarSyncProcessor);
 migrationQueue.process('catchup', 2, catchupProcessor);
+migrationQueue.process('bicom-migration', 2, bicomMigrationProcessor);
 
 // Event handlers
 migrationQueue.on('completed', (job) => {
@@ -126,6 +129,7 @@ app.get('/health', async (req, res) => {
 
 // Migration routes
 app.use('/migrations', migrationRoutes);
+app.use('/bicom', bicomRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -154,10 +158,10 @@ async function start() {
     }
     logger.info('✅ Connected to Supabase');
 
-    // Start Express server
-    app.listen(PORT, () => {
+    // Start Express server (bind to 0.0.0.0 for Railway)
+    app.listen(PORT, '0.0.0.0', () => {
       logger.info(`🚀 Migration worker listening on port ${PORT}`);
-      logger.info(`📡 Health check: http://localhost:${PORT}/health`);
+      logger.info(`📡 Health check: http://0.0.0.0:${PORT}/health`);
       logger.info(`🔄 Endpoints: POST /migrations/start, GET /migrations/:id/status`);
     });
   } catch (error) {
