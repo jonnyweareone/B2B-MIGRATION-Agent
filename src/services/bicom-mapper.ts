@@ -30,7 +30,7 @@ export interface MigrationParams {
   bicom_tenant_id: string; target_org_id: string; dry_run?: boolean
 }
 
-interface MigrationResult {
+export interface MigrationResult {
   status: 'synced' | 'partial' | 'error'
   extensionsSynced: number; ringsSynced: number; ivrsSynced: number; didsSynced: number
   pendingInvites: Array<{ email: string; display_name: string; org_user_id: string }>
