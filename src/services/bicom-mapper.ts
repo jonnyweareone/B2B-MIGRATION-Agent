@@ -36,7 +36,22 @@ export interface MigrationResult {
   pendingInvites: Array<{ email: string; display_name: string; org_user_id: string }>
 }
 
-export async function migrateBicomTenant(params: MigrationParams): Promise<MigrationResult> {
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+// Patterns that indicate a placeholder/dummy email not suitable for auth
+const DUMMY_EMAIL_RE = /^a@[bc]\.com$|^noemail|^no@email|^dummy|^placeholder|^none@|@none\.|^test@|@test\.|@example\.|^info@|^admin@|^sales@|^reception@|^office@|^accounts@|^hello@|^contact@/i
+
+function isDummyEmail(email: string): boolean {
+  return DUMMY_EMAIL_RE.test(email.trim())
+}
+
+// Generate a unique internal email for users with no real email
+// Format: ext.{ext_num}.{tenant_id}@bicom.internal — never used for sending
+function internalEmail(extNum: string, tenantId: string, serverUrl: string): string {
+  const domain = serverUrl.replace(/https?:\/\//, '').replace(/[^a-z0-9.]/gi, '').slice(0, 30)
+  return `ext.${extNum}.t${tenantId}@${domain}.internal`
+}
+(params: MigrationParams): Promise<MigrationResult> {
   const { tenant_sync_id, server_url, api_key, bicom_tenant_id, target_org_id, dry_run = false } = params
   const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
@@ -76,9 +91,20 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
     let extensionsSynced = 0
 
     for (const ext of extensions) {
-      if (!ext.email) { logger.warn(`[BiCom] Ext ${ext.ext} no email — skip`); continue }
       if (ext.status === '0' || ext.status === 'disabled') continue
       try {
+        const rawEmail = (ext.email || '').trim().toLowerCase()
+        const hasDummyEmail = !rawEmail || isDummyEmail(rawEmail)
+        
+        // Determine the email to use for this extension
+        // - Real email: use as-is for auth (may be shared across extensions/tenants)
+        // - Dummy/missing: use internal placeholder — NO auth account created
+        const authEmail = hasDummyEmail ? null : rawEmail
+        const displayEmail = rawEmail || null  // Store whatever BiCom had, even if dummy
+
+        if (hasDummyEmail) {
+          logger.info(`[BiCom] Ext ${ext.ext} (${ext.name}) — dummy/missing email "${rawEmail}", creating internal user only`)
+        }
         // Fetch full config, caller IDs, BLF keys, call forward — in parallel
         const [fullConf, clidConf, blfConf, cfwdConf] = await Promise.all([
           bicomGet(server_url, api_key, 'pbxware.ext.configuration', bicom_tenant_id, { id: ext._id })
@@ -107,24 +133,50 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
           enabled: cfwdConf.enabled || [], destination: cfwdConf.destinations || null, timeout: cfwdConf.timeouts || null,
         } : null
 
-        // Find or create Supabase auth user — use targeted lookup, not listUsers()
+        // Auth user handling:
+        // - Real email: find existing or create — supports login, invites
+        // - Dummy/shared email: create internal placeholder — NO real auth account
+        // - Intra-tenant dups (same real email, multiple exts): reuse same auth user
         let userId: string
-        const { data: existingUser } = await sb.auth.admin.getUserByEmail(ext.email).catch(() => ({ data: null }))
-        if (existingUser?.user) {
-          userId = existingUser.user.id
-          logger.info(`[BiCom] Found existing auth user for ${ext.email}`)
+        let canInvite = false
+
+        if (authEmail) {
+          // Real email — find or create auth user
+          const { data: existingUser } = await sb.auth.admin.getUserByEmail(authEmail).catch(() => ({ data: null }))
+          if (existingUser?.user) {
+            userId = existingUser.user.id
+            logger.info(`[BiCom] Found existing auth user for ${authEmail}`)
+          } else {
+            const { data: nu, error: ae } = await sb.auth.admin.createUser({
+              email: authEmail, email_confirm: false,
+              user_metadata: { display_name: ext.name, source: 'bicom_migration' },
+            })
+            if (ae || !nu?.user) throw new Error(`Auth create: ${ae?.message}`)
+            userId = nu.user.id
+            logger.info(`[BiCom] Created auth user for ${authEmail}`)
+          }
+          canInvite = true
         } else {
-          const { data: nu, error: ae } = await sb.auth.admin.createUser({
-            email: ext.email, email_confirm: false,
-            user_metadata: { display_name: ext.name, source: 'bicom_migration' },
-          })
-          if (ae || !nu?.user) throw new Error(`Auth create: ${ae?.message}`)
-          userId = nu.user.id
-          logger.info(`[BiCom] Created auth user for ${ext.email}`)
+          // Dummy/missing email — check if we already created an internal user for this ext
+          // Uses a synthetic internal email as stable identifier
+          const syntheticEmail = internalEmail(ext.ext, bicom_tenant_id, server_url)
+          const { data: existingInternal } = await sb.auth.admin.getUserByEmail(syntheticEmail).catch(() => ({ data: null }))
+          if (existingInternal?.user) {
+            userId = existingInternal.user.id
+          } else {
+            const { data: nu, error: ae } = await sb.auth.admin.createUser({
+              email: syntheticEmail, email_confirm: true,  // pre-confirm so it doesn't send anything
+              user_metadata: { display_name: ext.name, source: 'bicom_migration', internal_user: true, bicom_email: rawEmail },
+            })
+            if (ae || !nu?.user) throw new Error(`Auth create internal: ${ae?.message}`)
+            userId = nu.user.id
+          }
+          canInvite = false  // Can't invite without real email — admin must update manually
         }
 
         const { data: ou, error: ouErr } = await sb.from('org_users').upsert({
-          org_id: target_org_id, user_id: userId, email: ext.email,
+          org_id: target_org_id, user_id: userId,
+          email: authEmail || displayEmail,  // store real email if we have it
           display_name: ext.name, role: 'member', extension: ext.ext,
           department: ext.department || null,
           caller_id_name: opts.callerid ? opts.callerid.split('<')[0].trim() : ext.name,
@@ -145,15 +197,24 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
             blf_keys: blfKeys.length > 0 ? blfKeys : null,
             call_forward: callForward,
             codec_allow: opts.allow || ['ulaw', 'alaw'],
+            // Email status flags
+            has_real_email: !!authEmail,
+            bicom_email: displayEmail,
+            can_invite: canInvite,
+            email_note: hasDummyEmail ? `BiCom had dummy email "${rawEmail}" — needs real email before invite` : null,
             migrated_at: new Date().toISOString(),
           },
         }, { onConflict: 'org_id,user_id' }).select('id').single()
 
         if (ouErr) throw new Error(`org_users: ${ouErr.message}`)
         extToOrgUserId[ext.ext] = ou!.id
-        pendingInvites.push({ email: ext.email, display_name: ext.name, org_user_id: ou!.id })
+        
+        // Only queue invite for users with real emails
+        if (canInvite && authEmail) {
+          pendingInvites.push({ email: authEmail, display_name: ext.name, org_user_id: ou!.id })
+        }
         extensionsSynced++
-        logger.info(`[BiCom] ✓ User ${ext.name} (ext ${ext.ext})`)
+        logger.info(`[BiCom] ✓ User ${ext.name} (ext ${ext.ext}) — ${canInvite ? 'invite queued' : 'no real email, manual setup needed'}`)
       } catch (e: any) { logger.warn(`[BiCom] Ext ${ext.ext}: ${e.message}`) }
     }
     await updateSync('in_progress', undefined, { extensions_synced: extensionsSynced })
@@ -348,10 +409,15 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
     }
 
     // ── Step 7: Store pending invites — NOT sent yet ──────────────────────────
+    // Also track users needing real email (dummy/placeholder in BiCom)
+    const needsEmail = extensions
+      .filter(e => e.status !== '0' && isDummyEmail((e.email || '').trim()))
+      .map(e => ({ ext: e.ext, name: e.name, bicom_email: e.email, org_user_id: extToOrgUserId[e.ext] || null }))
     // Superadmin reviews migration first, then triggers invite send separately
     await sb.from('bicom_tenant_sync').update({
       sync_summary: {
         pending_invites: pendingInvites,
+        needs_email_update: needsEmail,
         invite_sent: false,
         completed_at: new Date().toISOString(),
       },
