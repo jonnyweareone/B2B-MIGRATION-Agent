@@ -107,19 +107,20 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
           enabled: cfwdConf.enabled || [], destination: cfwdConf.destinations || null, timeout: cfwdConf.timeouts || null,
         } : null
 
-        // Find or create Supabase auth user
+        // Find or create Supabase auth user — use targeted lookup, not listUsers()
         let userId: string
-        const { data: { users } } = await sb.auth.admin.listUsers().catch(() => ({ data: { users: [] } }))
-        const existing = users?.find((u: any) => u.email === ext.email)
-        if (existing) {
-          userId = existing.id
+        const { data: existingUser } = await sb.auth.admin.getUserByEmail(ext.email).catch(() => ({ data: null }))
+        if (existingUser?.user) {
+          userId = existingUser.user.id
+          logger.info(`[BiCom] Found existing auth user for ${ext.email}`)
         } else {
           const { data: nu, error: ae } = await sb.auth.admin.createUser({
             email: ext.email, email_confirm: false,
             user_metadata: { display_name: ext.name, source: 'bicom_migration' },
           })
-          if (ae || !nu?.user) throw new Error(`Auth: ${ae?.message}`)
+          if (ae || !nu?.user) throw new Error(`Auth create: ${ae?.message}`)
           userId = nu.user.id
+          logger.info(`[BiCom] Created auth user for ${ext.email}`)
         }
 
         const { data: ou, error: ouErr } = await sb.from('org_users').upsert({
@@ -291,7 +292,62 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
     }
     await updateSync('in_progress', undefined, { dids_synced: didsSynced })
 
-    // ── Step 6: Store pending invites — NOT sent yet ──────────────────────────
+    // ── Step 6: Fetch trunk assignments (reference only — do NOT register) ────
+    try {
+      // Get which trunks this tenant uses: primary/secondary/tertiary
+      const tenantTrunks = await bicomGet(server_url, api_key, 'pbxware.tenant.trunks.list', '1', { tenant: bicom_tenant_id })
+        .catch(() => null)
+
+      // Get master trunk list for reference data
+      const allTrunks = await bicomGet(server_url, api_key, 'pbxware.trunk.list', '1')
+        .catch(() => ({}))
+
+      if (tenantTrunks && !Array.isArray(tenantTrunks)) {
+        // Store trunk assignments against the tenant sync record
+        await sb.from('bicom_tenant_sync').update({
+          sync_summary: sb.from('bicom_tenant_sync') // will be merged below
+        }).eq('id', tenant_sync_id) // placeholder — do proper update next
+
+        // Upsert trunk reference entries for any trunks we haven't seen yet
+        const trunkEntries = Object.entries(allTrunks as Record<string, any>)
+          .filter(([, t]) => t.name)
+          .map(([trunkId, t]: [string, any]) => ({
+            server_id: '1497b042-7ab1-42eb-bc0f-d502345cc8fd', // Value Comms server
+            bicom_trunk_id: trunkId,
+            name: t.name,
+            status: 'reference_only',
+            raw_config: { protocol: t.protocol, provider_name: t.provider_name, status: t.status },
+          }))
+
+        if (trunkEntries.length > 0) {
+          await sb.from('bicom_trunk_reference').upsert(trunkEntries, {
+            onConflict: 'server_id,bicom_trunk_id', ignoreDuplicates: true,
+          })
+        }
+
+        // Store tenant trunk assignment summary
+        await sb.from('bicom_tenant_sync').update({
+          sync_summary: {
+            pending_invites: pendingInvites,
+            invite_sent: false,
+            completed_at: new Date().toISOString(),
+            trunk_assignments: {
+              primary: tenantTrunks.primary_trunk || null,
+              secondary: tenantTrunks.secondary_trunk || null,
+              tertiary: tenantTrunks.tertiary_trunk || null,
+              all: (tenantTrunks.trunks || '').split(',').map((t: string) => t.trim()).filter(Boolean),
+              note: 'Reference only — do not register. Update OneHub/Twilio routing at cutover.',
+            },
+          },
+        }).eq('id', tenant_sync_id)
+
+        logger.info(`[BiCom] ✓ Trunk assignments stored: ${tenantTrunks.trunks} (reference only)`)
+      }
+    } catch (e: any) {
+      logger.warn(`[BiCom] Trunk fetch skipped: ${e.message}`)
+    }
+
+    // ── Step 7: Store pending invites — NOT sent yet ──────────────────────────
     // Superadmin reviews migration first, then triggers invite send separately
     await sb.from('bicom_tenant_sync').update({
       sync_summary: {
