@@ -2,6 +2,16 @@ import axios from 'axios'
 import { createClient } from '@supabase/supabase-js'
 import { logger } from '../utils/logger'
 
+const DUMMY_EMAIL_RE = /^a@[bc]\.com$|^noemail|^no@email|^dummy|^placeholder|^none@|@none\.|^test@|@test\.|@example\.|^info@|^admin@|^sales@|^reception@|^office@|^accounts@|^hello@|^contact@/i
+function isDummy(email: string) { return DUMMY_EMAIL_RE.test(email.trim()) }
+
+function e164(raw: string): string {
+  const d = raw.replace(/\D/g, '')
+  if (d.startsWith('44') && d.length >= 12) return `+${d}`
+  if (d.startsWith('0') && d.length === 11) return `+44${d.slice(1)}`
+  return raw
+}
+
 async function bicomGet(serverUrl: string, apiKey: string, action: string, serverId = '1', extra: Record<string, string> = {}) {
   const params: Record<string, string> = { apikey: apiKey, action, server: serverId, ...extra }
   const r = await axios.get(`${serverUrl.replace(/\/$/, '')}/index.php`, { params, timeout: 15000 })
@@ -15,176 +25,279 @@ function toArray(d: any): any[] {
   return Object.entries(d).map(([id, v]: [string, any]) => ({ _id: id, ...v }))
 }
 
-const DUMMY_EMAIL_RE = /^a@[bc]\.com$|^noemail|^no@email|^dummy|^placeholder|^none@|@none\.|^test@|@test\.|@example\.|^info@|^admin@|^sales@|^reception@|^office@|^accounts@|^hello@|^contact@/i
-function isDummy(email: string) { return DUMMY_EMAIL_RE.test(email.trim()) }
-
-// ── Server health check ───────────────────────────────────────────────────────
-export async function runServerHealthCheck(serverUrl: string, apiKey: string, serverId: string) {
+export async function runServerHealthCheck(serverUrl: string, apiKey: string) {
   const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
   const results: Record<string, any> = { checked_at: new Date().toISOString() }
-
   try {
-    // 1. Basic connectivity - extensions online count
-    const extOnline = await bicomGet(serverUrl, apiKey, 'pbxware.dashboard.ext_online')
-    results.extensions_online = extOnline?.count || 0
-
-    // 2. Services status
-    const services = await bicomGet(serverUrl, apiKey, 'pbxware.dashboard.services')
-    results.services = services
-    results.all_services_running = Object.values(services || {}).every(v => v === 'running')
-
-    // 3. Server resources
-    const [cpu, memory] = await Promise.all([
+    const [extOnline, services, cpu, memory, tenants, sipRegs, calls] = await Promise.all([
+      bicomGet(serverUrl, apiKey, 'pbxware.dashboard.ext_online'),
+      bicomGet(serverUrl, apiKey, 'pbxware.dashboard.services'),
       bicomGet(serverUrl, apiKey, 'pbxware.dashboard.cpu').catch(() => null),
       bicomGet(serverUrl, apiKey, 'pbxware.dashboard.memory').catch(() => null),
+      bicomGet(serverUrl, apiKey, 'pbxware.tenant.list'),
+      bicomGet(serverUrl, apiKey, 'pbxware.dashboard.sip_registrations').catch(() => null),
+      bicomGet(serverUrl, apiKey, 'pbxware.dashboard.calls').catch(() => null),
     ])
+    results.extensions_online = extOnline?.count || 0
+    results.services = services
+    results.all_services_running = Object.values(services || {}).every(v => v === 'running')
     results.cpu_usage = cpu?.inuse || null
     results.memory_usage = memory?.inuse || null
-
-    // 4. Tenant count
-    const tenants = await bicomGet(serverUrl, apiKey, 'pbxware.tenant.list')
     results.tenant_count = Object.keys(tenants || {}).length
-
-    // 5. SIP registrations
-    const sipRegs = await bicomGet(serverUrl, apiKey, 'pbxware.dashboard.sip_registrations').catch(() => null)
     results.sip_registrations = sipRegs || null
-
-    // 6. Calls overview
-    const calls = await bicomGet(serverUrl, apiKey, 'pbxware.dashboard.calls').catch(() => null)
     results.active_calls = calls || null
-
-    results.status = 'healthy'
-    results.error = null
-
-    // Store in bicom_servers
+    results.status = 'healthy'; results.error = null
     await sb.from('bicom_servers')
       .update({ health_check: results, health_checked_at: results.checked_at, health_status: 'healthy' })
       .eq('server_url', serverUrl)
-
-    logger.info(`[Health] Server ${serverUrl} healthy — ${results.tenant_count} tenants, ${results.extensions_online} exts online`)
+    logger.info(`[Health] ${serverUrl} healthy -- ${results.tenant_count} tenants`)
     return results
-
   } catch (e: any) {
-    results.status = 'unreachable'
-    results.error = e.message
+    results.status = 'unreachable'; results.error = e.message
     await sb.from('bicom_servers')
       .update({ health_check: results, health_checked_at: results.checked_at, health_status: 'unreachable' })
       .eq('server_url', serverUrl)
-    logger.error(`[Health] Server ${serverUrl} unreachable: ${e.message}`)
     return results
   }
 }
 
-// ── Tenant pre-migration analysis ─────────────────────────────────────────────
+export async function editBicomExtension(
+  serverUrl: string, apiKey: string, tenantId: string,
+  bicomExtId: string, fields: Record<string, string>
+) {
+  const result = await bicomGet(serverUrl, apiKey, 'pbxware.ext.edit', tenantId, { id: bicomExtId, ...fields })
+  if (!result.success) throw new Error(`Edit failed: ${JSON.stringify(result)}`)
+  logger.info(`[BiCom] Edited ext ${bicomExtId}: ${JSON.stringify(fields)}`)
+  return result
+}
+
+export async function editBicomDid(
+  serverUrl: string, apiKey: string, tenantId: string,
+  bicomDidId: string, fields: Record<string, string>
+) {
+  const result = await bicomGet(serverUrl, apiKey, 'pbxware.did.edit', tenantId, { id: bicomDidId, ...fields })
+  if (!result.success) throw new Error(`DID edit failed: ${JSON.stringify(result)}`)
+  logger.info(`[BiCom] Edited DID ${bicomDidId}: ${JSON.stringify(fields)}`)
+  return result
+}
+
+async function getExtDetail(serverUrl: string, apiKey: string, tenantId: string, extId: string) {
+  const [conf, clidConf, blfConf, cfwdConf] = await Promise.all([
+    bicomGet(serverUrl, apiKey, 'pbxware.ext.configuration', tenantId, { id: extId })
+      .then(d => Object.values(d)[0] as any).catch(() => null),
+    bicomGet(serverUrl, apiKey, 'pbxware.ext.es.callerid.configuration', tenantId, { id: extId }).catch(() => null),
+    bicomGet(serverUrl, apiKey, 'pbxware.ext.es.blflist.configuration', tenantId, { id: extId }).catch(() => null),
+    bicomGet(serverUrl, apiKey, 'pbxware.ext.es.callfwd.configuration', tenantId, { id: extId }).catch(() => null),
+  ])
+  const opts = conf?.options || {}
+  return {
+    mac: opts.mac || conf?.macaddress || null,
+    sn: opts.sn || null,
+    additional_macs: conf?.additional_macaddress
+      ? Object.values(conf.additional_macaddress as Record<string, string>)
+      : [],
+    autoprov: opts.autoprovisiong === '1',
+    dhcp: opts.dhcp === '1',
+    sip_username: opts.username || null,
+    ring_timeout: parseInt(opts.ringtime || '30'),
+    incoming_limit: parseInt(opts.incominglimit || '3'),
+    outgoing_limit: parseInt(opts.outgoinglimit || '3'),
+    voicemail: opts.voicemail === '1' || opts.voicemail === 1,
+    timezone: opts.ext_timezone || 'Europe/London',
+    codec_allow: opts.allow || ['ulaw', 'alaw'],
+    caller_id: {
+      default: clidConf?.default_callerid || null,
+      allowed: Object.values(clidConf?.allowed_callerids || {}).map((c: any) => ({
+        number: c.callerid, label: c.label, short_code: c.short_code || null,
+      })),
+      per_trunk: Object.entries(clidConf || {})
+        .filter(([k]) => k.startsWith('callerid:') && !k.endsWith(':privacy'))
+        .reduce((acc: any, [k, v]) => { acc[k.replace('callerid:', '')] = v; return acc }, {}),
+    },
+    blf_keys: (blfConf?.blfs || []).map((b: any) => ({
+      extension: b.ext || b.extension, label: b.name || b.label || b.ext, type: b.type || 'presence',
+    })),
+    call_forward: cfwdConf ? {
+      enabled: cfwdConf.enabled || [],
+      destination: cfwdConf.destinations || null,
+      timeout: cfwdConf.timeouts || null,
+    } : null,
+  }
+}
+
 export async function analyseTenant(
-  tenantSyncId: string,
-  serverUrl: string,
-  apiKey: string,
-  bicomTenantId: string
+  tenantSyncId: string, serverUrl: string, apiKey: string, bicomTenantId: string
 ) {
   const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-  // Fetch everything in parallel
-  const [rawExts, rawRings, rawIVRs, rawDIDs, tenantConf, tenantTrunks] = await Promise.all([
+  const [rawExts, rawRings, rawIVRs, rawDIDs, tenantConf, tenantTrunks, allTrunks] = await Promise.all([
     bicomGet(serverUrl, apiKey, 'pbxware.ext.list', bicomTenantId),
     bicomGet(serverUrl, apiKey, 'pbxware.ring_group.list', bicomTenantId),
     bicomGet(serverUrl, apiKey, 'pbxware.ivr.list', bicomTenantId),
     bicomGet(serverUrl, apiKey, 'pbxware.did.list', bicomTenantId),
     bicomGet(serverUrl, apiKey, 'pbxware.tenant.configuration', '1', { id: bicomTenantId }).catch(() => null),
     bicomGet(serverUrl, apiKey, 'pbxware.tenant.trunks.list', '1', { tenant: bicomTenantId }).catch(() => null),
+    bicomGet(serverUrl, apiKey, 'pbxware.trunk.list', '1').catch(() => ({})),
   ])
 
-  const extensions = toArray(rawExts)
+  const extensions = toArray(rawExts).filter(e => e.status !== '0' && e.status !== 'disabled')
   const ringGroups = toArray(rawRings)
   const ivrs = toArray(rawIVRs)
   const dids = toArray(rawDIDs)
 
-  // Email analysis
+  const trunkMap: Record<string, string> = {}
+  const trunkCarrierMap: Record<string, string> = {}
+  for (const [tid, t] of Object.entries(allTrunks as Record<string, any>)) {
+    trunkMap[tid] = t.name
+    const name = (t.name || '').toLowerCase()
+    trunkCarrierMap[tid] = name.includes('gamma') || name.includes('onecom') ? 'onehub'
+      : name.includes('twilio') ? 'twilio'
+      : name.includes('voiceflex') ? 'voiceflex' : 'other'
+  }
+
+  const extDetails: Record<string, any> = {}
+  await Promise.all(extensions.map(async ext => {
+    extDetails[ext._id] = await getExtDetail(serverUrl, apiKey, bicomTenantId, ext._id).catch(() => ({}))
+  }))
+
+  const ivrOtimes: Record<string, any> = {}
+  const rgOtimes: Record<string, any> = {}
+  await Promise.all([
+    ...ivrs.map(async ivr => {
+      const ot = await bicomGet(serverUrl, apiKey, 'pbxware.otimes.ivr.list', bicomTenantId, { id: ivr._id }).catch(() => null)
+      if (ot && !Array.isArray(ot)) ivrOtimes[ivr._id] = ot[ivr._id] || Object.values(ot)[0]
+    }),
+    ...ringGroups.map(async rg => {
+      const ot = await bicomGet(serverUrl, apiKey, 'pbxware.otimes.dial_group.list', bicomTenantId, { id: rg._id }).catch(() => null)
+      if (ot && !Array.isArray(ot)) rgOtimes[rg._id] = ot[rg._id] || Object.values(ot)[0]
+    }),
+  ])
+
+  const rgConfigs: Record<string, any> = {}
+  await Promise.all(ringGroups.map(async rg => {
+    const c = await bicomGet(serverUrl, apiKey, 'pbxware.ring_group.configuration', bicomTenantId, { id: rg._id }).catch(() => null)
+    if (c) rgConfigs[rg._id] = (Object.values(c)[0] as any)?.options || {}
+  }))
+
   const emailMap: Record<string, any[]> = {}
   const emailIssues: any[] = []
 
-  for (const ext of extensions) {
-    if (ext.status === '0' || ext.status === 'disabled') continue
+  const users = extensions.map(ext => {
     const email = (ext.email || '').trim().toLowerCase()
     if (!emailMap[email]) emailMap[email] = []
     emailMap[email].push({ ext: ext.ext, name: ext.name, bicom_id: ext._id })
-  }
+    const detail = extDetails[ext._id] || {}
+    return {
+      bicom_id: ext._id, name: ext.name, ext: ext.ext,
+      email: email || null, email_is_dummy: isDummy(email),
+      phone_model: ext.ua_name || null, phone_model_full: ext.ua_fullname || null,
+      mac: detail.mac || null, sn: detail.sn || null,
+      additional_macs: detail.additional_macs || [],
+      autoprov: detail.autoprov || false, dhcp: detail.dhcp !== false,
+      sip_username: detail.sip_username || null,
+      ring_timeout: detail.ring_timeout || 30,
+      incoming_limit: detail.incoming_limit || 3,
+      outgoing_limit: detail.outgoing_limit || 3,
+      voicemail: detail.voicemail || false,
+      timezone: detail.timezone || 'Europe/London',
+      codec_allow: detail.codec_allow || [],
+      caller_id: detail.caller_id || null,
+      blf_keys: detail.blf_keys || [],
+      call_forward: detail.call_forward || null,
+    }
+  })
 
   for (const [email, exts] of Object.entries(emailMap)) {
-    if (!email) {
-      emailIssues.push({ type: 'missing', email: null, extensions: exts })
-    } else if (isDummy(email)) {
-      emailIssues.push({ type: 'dummy', email, extensions: exts })
-    } else if (exts.length > 1) {
-      emailIssues.push({ type: 'intra_tenant_duplicate', email, extensions: exts,
-        note: 'Same real email on multiple extensions — will share one login' })
-    }
+    if (!email) emailIssues.push({ type: 'missing', email: null, extensions: exts })
+    else if (isDummy(email)) emailIssues.push({ type: 'dummy', email, extensions: exts })
+    else if (exts.length > 1) emailIssues.push({ type: 'intra_tenant_duplicate', email, extensions: exts, note: 'Shared login -- multiple handsets' })
   }
 
-  // UAD breakdown — which phone models are in use
+  const devices = users.map(u => ({
+    bicom_id: u.bicom_id, ext: u.ext, name: u.name,
+    model: u.phone_model_full || u.phone_model || 'Unknown',
+    mac: u.mac, sn: u.sn, additional_macs: u.additional_macs,
+    autoprov: u.autoprov, dhcp: u.dhcp,
+  }))
+
+  const didList = dids.map(did => ({
+    bicom_id: did._id, number: e164(did.number || ''), number_raw: did.number,
+    label: did.name || null, type: did.type || 'Unknown',
+    destination_ext: did.ext || null,
+    trunk_id: did.trunk || null, trunk_name: trunkMap[did.trunk] || did.trunk || null,
+    actual_carrier: trunkCarrierMap[did.trunk] || 'other',
+    status: did.status || 'enabled',
+  }))
+
+  const ringGroupList = ringGroups.map(rg => {
+    const conf = rgConfigs[rg._id] || {}
+    const ot = rgOtimes[rg._id]
+    const memberExts = (rg.destinations || '').split(',').map((e: string) => e.trim()).filter(Boolean)
+    return {
+      bicom_id: rg._id, name: rg.name, ext: rg.ext, type: 'ring_group' as const,
+      ring_strategy: conf.ring_strategy || 'all', timeout: parseInt(conf.timeout || '30'),
+      members: memberExts, member_count: memberExts.length,
+      overflow_ext: conf.last_dest || null, callerid_override: conf.callerid || null,
+      record_calls: conf.record === '1',
+      has_schedule: !!(ot && ot.status === 'on'),
+      schedule_closed_dates: ot?.closed_dates?.length || 0,
+      schedule_closed_dest: ot?.default_dest_ext || null,
+    }
+  })
+
+  const ivrList = ivrs.map(ivr => {
+    const ot = ivrOtimes[ivr._id]
+    return {
+      bicom_id: ivr._id, name: ivr.name, ext: ivr.ext, type: 'ivr' as const,
+      key_count: ivr.keymap ? Object.keys(ivr.keymap).length : 0,
+      is_active: ivr.status !== 'disabled', operator: ivr.operator || null,
+      has_schedule: !!(ot && ot.status === 'on'),
+      schedule_closed_dates: ot?.closed_dates?.length || 0,
+      schedule_closed_dest: ot?.default_dest_ext || null,
+    }
+  })
+
   const uadCounts: Record<string, number> = {}
-  const macAddresses: Array<{ ext: string; name: string; model: string; mac: string }> = []
-
-  for (const ext of extensions) {
-    const model = ext.ua_name || ext.ua_fullname || 'Unknown'
-    uadCounts[model] = (uadCounts[model] || 0) + 1
-    if (ext.macaddress || ext.additional_macaddress) {
-      macAddresses.push({
-        ext: ext.ext, name: ext.name, model,
-        mac: ext.macaddress || ext.additional_macaddress
-      })
-    }
+  for (const u of users) {
+    const m = u.phone_model_full || u.phone_model || 'Unknown'
+    uadCounts[m] = (uadCounts[m] || 0) + 1
   }
-
-  // Channel capacity from tenant config
-  const channelInfo = tenantConf ? {
-    incoming_limit: tenantConf.incominglimit,
-    outgoing_limit: tenantConf.outgoinglimit,
-    concurrent_calls: tenantConf.conch,
-    queue_channels: tenantConf.quech,
-    erg_channels: tenantConf.ergch,
-    emergency_email: tenantConf.es_notification_email,
-    autoprovision_user: tenantConf.apusername,
-    status: tenantConf.status,
-    country: tenantConf.country,
-  } : null
 
   const analysis = {
     analysed_at: new Date().toISOString(),
     summary: {
-      extensions: extensions.filter(e => e.status !== '0').length,
-      extensions_disabled: extensions.filter(e => e.status === '0').length,
-      ring_groups: ringGroups.length,
-      ivrs: ivrs.length,
-      dids: dids.length,
+      extensions: users.length, ring_groups: ringGroups.length,
+      ivrs: ivrs.length, dids: dids.length,
       emails_real: Object.entries(emailMap).filter(([e]) => e && !isDummy(e)).length,
       emails_dummy: Object.entries(emailMap).filter(([e]) => isDummy(e)).length,
       emails_missing: Object.entries(emailMap).filter(([e]) => !e).length,
       invites_ready: Object.entries(emailMap).filter(([e]) => e && !isDummy(e) && emailMap[e].length === 1).length,
       needs_attention: emailIssues.length,
+      devices_with_sn: users.filter(u => u.sn).length,
+      devices_with_mac: users.filter(u => u.mac).length,
     },
-    email_issues: emailIssues,
-    uad_breakdown: uadCounts,
-    phones_with_mac: macAddresses,
-    channel_info: channelInfo,
-    trunk_assignments: tenantTrunks ? {
-      primary: tenantTrunks.primary_trunk,
-      secondary: tenantTrunks.secondary_trunk,
-      tertiary: tenantTrunks.tertiary_trunk,
-      all: tenantTrunks.trunks,
+    email_issues: emailIssues, uad_breakdown: uadCounts,
+    users, devices, dids: didList, ring_groups: ringGroupList, ivrs: ivrList,
+    channel_info: tenantConf ? {
+      incoming_limit: tenantConf.incominglimit, outgoing_limit: tenantConf.outgoinglimit,
+      concurrent_calls: tenantConf.conch, queue_channels: tenantConf.quech,
+      emergency_email: tenantConf.es_notification_email, autoprovision_user: tenantConf.apusername,
+      status: tenantConf.status,
     } : null,
-    // Ready to migrate?
+    trunk_assignments: tenantTrunks ? {
+      primary: tenantTrunks.primary_trunk, secondary: tenantTrunks.secondary_trunk,
+      tertiary: tenantTrunks.tertiary_trunk, all: tenantTrunks.trunks,
+    } : null,
     migration_readiness: {
-      can_auto_migrate: emailIssues.filter(i => i.type === 'dummy' || i.type === 'missing').length === 0,
-      warnings: emailIssues.length,
-      blockers: 0,
-    }
+      can_auto_migrate: emailIssues.filter((i: any) => i.type === 'dummy' || i.type === 'missing').length === 0,
+      warnings: emailIssues.length, blockers: 0,
+    },
   }
 
   await sb.from('bicom_tenant_sync')
     .update({ pre_migration_analysis: analysis, analysis_run_at: analysis.analysed_at })
     .eq('id', tenantSyncId)
 
-  logger.info(`[Analysis] Tenant ${bicomTenantId}: ${analysis.summary.extensions} exts, ${analysis.email_issues.length} email issues`)
+  logger.info(`[Analysis] Tenant ${bicomTenantId}: ${users.length} users, ${users.filter(u => u.sn).length} SNs`)
   return analysis
 }
