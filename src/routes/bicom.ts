@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express'
 import { migrateBicomTenant } from '../services/bicom-mapper'
+import { runServerHealthCheck, analyseTenant } from '../services/bicom-analysis'
 import { logger } from '../utils/logger'
 
 const router = Router()
@@ -109,6 +110,28 @@ router.post('/servers/:id/discover', async (req: Request, res: Response) => {
     }).eq('id', srv.id)
 
     res.json({ ok: true, count: tenants.length })
+  } catch (e: any) { res.status(500).json({ error: e.message }) }
+})
+
+// POST /bicom/health-check — run server health check, store results
+router.post('/health-check', async (req: Request, res: Response) => {
+  const { server_url, api_key } = req.body
+  if (!server_url || !api_key) return res.status(400).json({ error: 'Missing server_url or api_key' })
+  try {
+    const result = await runServerHealthCheck(server_url, api_key, '1')
+    res.json({ ok: result.status === 'healthy', ...result })
+  } catch (e: any) { res.status(500).json({ error: e.message }) }
+})
+
+// POST /bicom/analyse — pre-migration tenant analysis (email issues, UADs, counts etc)
+router.post('/analyse', async (req: Request, res: Response) => {
+  const { tenant_sync_id, server_url, api_key, bicom_tenant_id } = req.body
+  if (!tenant_sync_id || !server_url || !api_key || !bicom_tenant_id) {
+    return res.status(400).json({ error: 'Missing required fields' })
+  }
+  try {
+    const analysis = await analyseTenant(tenant_sync_id, server_url, api_key, bicom_tenant_id)
+    res.json({ ok: true, analysis })
   } catch (e: any) { res.status(500).json({ error: e.message }) }
 })
 
