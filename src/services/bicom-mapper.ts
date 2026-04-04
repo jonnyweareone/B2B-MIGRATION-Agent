@@ -46,12 +46,13 @@ function isDummyEmail(email: string): boolean {
 }
 
 // Generate a unique internal email for users with no real email
-// Format: ext.{ext_num}.{tenant_id}@bicom.internal — never used for sending
+// Format: ext.{ext_num}.{tenant_id}@bicom.internal -- never used for sending
 function internalEmail(extNum: string, tenantId: string, serverUrl: string): string {
   const domain = serverUrl.replace(/https?:\/\//, '').replace(/[^a-z0-9.]/gi, '').slice(0, 30)
   return `ext.${extNum}.t${tenantId}@${domain}.internal`
 }
-(params: MigrationParams): Promise<MigrationResult> {
+
+export async function migrateBicomTenant(params: MigrationParams): Promise<MigrationResult> {
   const { tenant_sync_id, server_url, api_key, bicom_tenant_id, target_org_id, dry_run = false } = params
   const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
@@ -63,7 +64,7 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
   }
 
   try {
-    logger.info(`[BiCom] Starting migration — tenant ${bicom_tenant_id} → org ${target_org_id}`)
+    logger.info(`[BiCom] Starting migration -- tenant ${bicom_tenant_id} → org ${target_org_id}`)
     if (!dry_run) await updateSync('in_progress')
 
     // ── Step 1: Fetch all BiCom data ─────────────────────────────────────────
@@ -98,14 +99,14 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
         
         // Determine the email to use for this extension
         // - Real email: use as-is for auth (may be shared across extensions/tenants)
-        // - Dummy/missing: use internal placeholder — NO auth account created
+        // - Dummy/missing: use internal placeholder -- NO auth account created
         const authEmail = hasDummyEmail ? null : rawEmail
         const displayEmail = rawEmail || null  // Store whatever BiCom had, even if dummy
 
         if (hasDummyEmail) {
-          logger.info(`[BiCom] Ext ${ext.ext} (${ext.name}) — dummy/missing email "${rawEmail}", creating internal user only`)
+          logger.info(`[BiCom] Ext ${ext.ext} (${ext.name}) -- dummy/missing email "${rawEmail}", creating internal user only`)
         }
-        // Fetch full config, caller IDs, BLF keys, call forward — in parallel
+        // Fetch full config, caller IDs, BLF keys, call forward -- in parallel
         const [fullConf, clidConf, blfConf, cfwdConf] = await Promise.all([
           bicomGet(server_url, api_key, 'pbxware.ext.configuration', bicom_tenant_id, { id: ext._id })
             .then(d => Object.values(d)[0] as any).catch(() => null),
@@ -134,44 +135,41 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
         } : null
 
         // Auth user handling:
-        // - Real email: find existing or create — supports login, invites
-        // - Dummy/shared email: create internal placeholder — NO real auth account
+        // - Real email: find existing or create -- supports login, invites
+        // - Dummy/shared email: create internal placeholder -- NO real auth account
         // - Intra-tenant dups (same real email, multiple exts): reuse same auth user
         let userId: string
         let canInvite = false
 
-        if (authEmail) {
-          // Real email — find or create auth user
-          const { data: existingUser } = await sb.auth.admin.getUserByEmail(authEmail).catch(() => ({ data: null }))
-          if (existingUser?.user) {
-            userId = existingUser.user.id
-            logger.info(`[BiCom] Found existing auth user for ${authEmail}`)
-          } else {
-            const { data: nu, error: ae } = await sb.auth.admin.createUser({
-              email: authEmail, email_confirm: false,
-              user_metadata: { display_name: ext.name, source: 'bicom_migration' },
-            })
-            if (ae || !nu?.user) throw new Error(`Auth create: ${ae?.message}`)
-            userId = nu.user.id
-            logger.info(`[BiCom] Created auth user for ${authEmail}`)
+        // Find existing auth user or create new one.
+        // In Supabase JS v2, there's no getUserByEmail -- we attempt createUser and
+        // if the email already exists it returns an error with code 'email_exists'.
+        // In that case we fall back to listUsers filtered by email.
+        async function findOrCreateUser(email: string, metadata: object, confirmEmail = false): Promise<string> {
+          const { data: created, error: createErr } = await sb.auth.admin.createUser({
+            email, email_confirm: confirmEmail, user_metadata: metadata,
+          })
+          if (created?.user) return created.user.id
+          // User already exists -- find them via listUsers with filter
+          if (createErr?.message?.includes('already') || createErr?.status === 422) {
+            const { data: list } = await sb.auth.admin.listUsers({ perPage: 1000 })
+            const found = list?.users?.find((u: any) => u.email === email)
+            if (found) return found.id
           }
+          throw new Error(`Auth findOrCreate failed for ${email}: ${createErr?.message}`)
+        }
+
+        if (authEmail) {
+          // Real email -- find or create auth user
+          const existingId = await findOrCreateUser(authEmail, { display_name: ext.name, source: 'bicom_migration' })
+          userId = existingId
           canInvite = true
         } else {
-          // Dummy/missing email — check if we already created an internal user for this ext
-          // Uses a synthetic internal email as stable identifier
+          // Dummy/missing email -- use synthetic internal email as stable identifier
           const syntheticEmail = internalEmail(ext.ext, bicom_tenant_id, server_url)
-          const { data: existingInternal } = await sb.auth.admin.getUserByEmail(syntheticEmail).catch(() => ({ data: null }))
-          if (existingInternal?.user) {
-            userId = existingInternal.user.id
-          } else {
-            const { data: nu, error: ae } = await sb.auth.admin.createUser({
-              email: syntheticEmail, email_confirm: true,  // pre-confirm so it doesn't send anything
-              user_metadata: { display_name: ext.name, source: 'bicom_migration', internal_user: true, bicom_email: rawEmail },
-            })
-            if (ae || !nu?.user) throw new Error(`Auth create internal: ${ae?.message}`)
-            userId = nu.user.id
-          }
-          canInvite = false  // Can't invite without real email — admin must update manually
+          userId = await findOrCreateUser(syntheticEmail,
+            { display_name: ext.name, source: 'bicom_migration', internal_user: true, bicom_email: rawEmail }, true)
+          canInvite = false
         }
 
         const { data: ou, error: ouErr } = await sb.from('org_users').upsert({
@@ -201,7 +199,7 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
             has_real_email: !!authEmail,
             bicom_email: displayEmail,
             can_invite: canInvite,
-            email_note: hasDummyEmail ? `BiCom had dummy email "${rawEmail}" — needs real email before invite` : null,
+            email_note: hasDummyEmail ? `BiCom had dummy email "${rawEmail}" -- needs real email before invite` : null,
             migrated_at: new Date().toISOString(),
           },
         }, { onConflict: 'org_id,user_id' }).select('id').single()
@@ -214,7 +212,7 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
           pendingInvites.push({ email: authEmail, display_name: ext.name, org_user_id: ou!.id })
         }
         extensionsSynced++
-        logger.info(`[BiCom] ✓ User ${ext.name} (ext ${ext.ext}) — ${canInvite ? 'invite queued' : 'no real email, manual setup needed'}`)
+        logger.info(`[BiCom] [OK] User ${ext.name} (ext ${ext.ext}) -- ${canInvite ? 'invite queued' : 'no real email, manual setup needed'}`)
       } catch (e: any) { logger.warn(`[BiCom] Ext ${ext.ext}: ${e.message}`) }
     }
     await updateSync('in_progress', undefined, { extensions_synced: extensionsSynced })
@@ -261,7 +259,7 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
         if (error) throw new Error(error.message)
         extToFlowId[rg.ext] = flow!.id
         ringsSynced++
-        logger.info(`[BiCom] ✓ Ring group "${rg.name}" (${rg.ext})${otimes ? ' [schedule]' : ''}`)
+        logger.info(`[BiCom] [OK] Ring group "${rg.name}" (${rg.ext})${otimes ? ' [schedule]' : ''}`)
       } catch (e: any) { logger.warn(`[BiCom] Ring group "${rg.name}": ${e.message}`) }
     }
     await updateSync('in_progress', undefined, { ring_groups_synced: ringsSynced })
@@ -308,7 +306,7 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
         if (error) throw new Error(error.message)
         extToFlowId[ivr.ext] = flow!.id
         ivrsSynced++
-        logger.info(`[BiCom] ✓ IVR "${ivr.name}" (${ivr.ext})${otimes ? ' [schedule]' : ''}`)
+        logger.info(`[BiCom] [OK] IVR "${ivr.name}" (${ivr.ext})${otimes ? ' [schedule]' : ''}`)
       } catch (e: any) { logger.warn(`[BiCom] IVR "${ivr.name}": ${e.message}`) }
     }
     await updateSync('in_progress', undefined, { ivrs_synced: ivrsSynced })
@@ -322,10 +320,10 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
         const normalised = e164(did.number)
         let callFlowId: string | null = extToFlowId[did.ext] || null
 
-        // DID points to bare extension — auto-create a direct ring flow
+        // DID points to bare extension -- auto-create a direct ring flow
         if (!callFlowId && did.type === 'Extension' && did.ext) {
           const { data: flow } = await sb.from('call_flows').upsert({
-            org_id: target_org_id, name: `Direct — ${did.ext}`, flow_type: 'direct',
+            org_id: target_org_id, name: `Direct -- ${did.ext}`, flow_type: 'direct',
             entrypoint: 'start', is_active: true,
             settings: { extension: did.ext, bicom_tenant_id, migrated_at: new Date().toISOString() },
             workflow_steps: [
@@ -348,12 +346,12 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
 
         if (error) throw new Error(error.message)
         didsSynced++
-        logger.info(`[BiCom] ✓ DID ${normalised} → flow ${callFlowId}`)
+        logger.info(`[BiCom] [OK] DID ${normalised} → flow ${callFlowId}`)
       } catch (e: any) { logger.warn(`[BiCom] DID ${did.number}: ${e.message}`) }
     }
     await updateSync('in_progress', undefined, { dids_synced: didsSynced })
 
-    // ── Step 6: Fetch trunk assignments (reference only — do NOT register) ────
+    // ── Step 6: Fetch trunk assignments (reference only -- do NOT register) ────
     try {
       // Get which trunks this tenant uses: primary/secondary/tertiary
       const tenantTrunks = await bicomGet(server_url, api_key, 'pbxware.tenant.trunks.list', '1', { tenant: bicom_tenant_id })
@@ -364,11 +362,6 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
         .catch(() => ({}))
 
       if (tenantTrunks && !Array.isArray(tenantTrunks)) {
-        // Store trunk assignments against the tenant sync record
-        await sb.from('bicom_tenant_sync').update({
-          sync_summary: sb.from('bicom_tenant_sync') // will be merged below
-        }).eq('id', tenant_sync_id) // placeholder — do proper update next
-
         // Upsert trunk reference entries for any trunks we haven't seen yet
         const trunkEntries = Object.entries(allTrunks as Record<string, any>)
           .filter(([, t]) => t.name)
@@ -387,28 +380,14 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
         }
 
         // Store tenant trunk assignment summary
-        await sb.from('bicom_tenant_sync').update({
-          sync_summary: {
-            pending_invites: pendingInvites,
-            invite_sent: false,
-            completed_at: new Date().toISOString(),
-            trunk_assignments: {
-              primary: tenantTrunks.primary_trunk || null,
-              secondary: tenantTrunks.secondary_trunk || null,
-              tertiary: tenantTrunks.tertiary_trunk || null,
-              all: (tenantTrunks.trunks || '').split(',').map((t: string) => t.trim()).filter(Boolean),
-              note: 'Reference only — do not register. Update OneHub/Twilio routing at cutover.',
-            },
-          },
-        }).eq('id', tenant_sync_id)
-
-        logger.info(`[BiCom] ✓ Trunk assignments stored: ${tenantTrunks.trunks} (reference only)`)
+        const trunkSummary = { primary: tenantTrunks.primary_trunk, secondary: tenantTrunks.secondary_trunk, all: tenantTrunks.trunks }
+        logger.info('[BiCom] Trunk: ' + JSON.stringify(trunkSummary))
       }
     } catch (e: any) {
       logger.warn(`[BiCom] Trunk fetch skipped: ${e.message}`)
     }
 
-    // ── Step 7: Store pending invites — NOT sent yet ──────────────────────────
+    // ── Step 7: Store pending invites -- NOT sent yet ──────────────────────────
     // Also track users needing real email (dummy/placeholder in BiCom)
     const needsEmail = extensions
       .filter(e => e.status !== '0' && isDummyEmail((e.email || '').trim()))
@@ -436,11 +415,11 @@ function internalEmail(extNum: string, tenantId: string, serverUrl: string): str
       ivrs_synced: ivrsSynced, dids_synced: didsSynced,
     })
 
-    logger.info(`[BiCom] ✅ ${status} (${totalSynced}/${totalExpected}) — ${pendingInvites.length} invites pending review`)
+    logger.info(`[BiCom] [OK] ${status} (${totalSynced}/${totalExpected}) -- ${pendingInvites.length} invites pending review`)
     return { status, extensionsSynced, ringsSynced, ivrsSynced, didsSynced, pendingInvites }
 
   } catch (e: any) {
-    logger.error(`[BiCom] ❌ FAILED tenant ${bicom_tenant_id}: ${e.message}`)
+    logger.error(`[BiCom] [ERR] FAILED tenant ${bicom_tenant_id}: ${e.message}`)
     await updateSync('error', e.message)
     throw e
   }
