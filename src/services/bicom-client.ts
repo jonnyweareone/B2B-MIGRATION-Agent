@@ -1,5 +1,8 @@
 import axios, { AxiosInstance } from 'axios';
 
+// BiCom PBXware MT API uses /index.php?apikey=KEY&action=pbxware.ACTION&server=TENANT_ID
+// NOT a REST /api/ path
+
 export class BiComClient {
   private base: string;
   private apiKey: string;
@@ -8,71 +11,106 @@ export class BiComClient {
   constructor(serverUrl: string, apiKey: string) {
     this.base = serverUrl.replace(/\/$/, '');
     this.apiKey = apiKey;
-    this.http = axios.create({
-      baseURL: this.base,
-      timeout: 30000,
-    });
+    this.http = axios.create({ baseURL: this.base, timeout: 30000 });
   }
 
-  private async request<T>(path: string, params: Record<string, any> = {}): Promise<T> {
-    const r = await this.http.get<T>(path, {
-      params: { ...params, api_key: this.apiKey },
+  private async request<T>(action: string, params: Record<string, any> = {}): Promise<T> {
+    const r = await this.http.get<T>('/index.php', {
+      params: { apikey: this.apiKey, action, ...params },
     });
     return r.data;
   }
 
+  // Tenants — returns object keyed by server ID
   async listTenants(): Promise<any[]> {
-    const data = await this.request<any>('/api/tenant');
-    return Array.isArray(data) ? data : data?.data || data?.tenants || [];
+    const data = await this.request<Record<string, any>>('pbxware.tenant.list');
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      return Object.entries(data).map(([serverId, t]: [string, any]) => ({
+        id: serverId,
+        server_id: serverId,
+        name: t.name?.trim(),
+        tenantcode: t.tenantcode,
+        package: t.package,
+        ext_length: t.ext_length,
+        country_code: t.country_code,
+      }));
+    }
+    return [];
   }
 
-  async getTenant(tenantId: string): Promise<any> {
-    return this.request(`/api/tenant/${tenantId}`);
+  async getTenant(serverId: string): Promise<any> {
+    const data = await this.request<any>('pbxware.tenant.configuration', { server: serverId });
+    return data;
   }
 
-  async listExtensions(tenantId: string): Promise<any[]> {
-    const data = await this.request<any>('/api/extension', { tenant: tenantId });
-    return Array.isArray(data) ? data : data?.data || data?.extensions || [];
+  // Extensions
+  async listExtensions(serverId: string): Promise<any[]> {
+    const data = await this.request<any>('pbxware.ext.list', { server: serverId });
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      return Object.entries(data).map(([id, e]: [string, any]) => ({ id, ...e }));
+    }
+    return Array.isArray(data) ? data : [];
   }
 
-  async getExtension(tenantId: string, extId: string): Promise<any> {
-    return this.request(`/api/extension/${extId}`, { tenant: tenantId });
+  async getExtension(serverId: string, extId: string): Promise<any> {
+    return this.request('pbxware.ext.configuration', { server: serverId, id: extId });
   }
 
-  async listRingGroups(tenantId: string): Promise<any[]> {
-    const data = await this.request<any>('/api/ringgroup', { tenant: tenantId });
-    return Array.isArray(data) ? data : data?.data || data?.groups || [];
+  // Ring groups
+  async listRingGroups(serverId: string): Promise<any[]> {
+    const data = await this.request<any>('pbxware.ring_group.list', { server: serverId });
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      return Object.entries(data).map(([id, r]: [string, any]) => ({ id, ...r }));
+    }
+    return Array.isArray(data) ? data : [];
   }
 
-  async getRingGroup(tenantId: string, groupId: string): Promise<any> {
-    return this.request(`/api/ringgroup/${groupId}`, { tenant: tenantId });
+  async getRingGroup(serverId: string, groupId: string): Promise<any> {
+    return this.request('pbxware.ring_group.configuration', { server: serverId, id: groupId });
   }
 
-  async listQueues(tenantId: string): Promise<any[]> {
-    const data = await this.request<any>('/api/queue', { tenant: tenantId });
-    return Array.isArray(data) ? data : data?.data || data?.queues || [];
+  // Enhanced ring groups (queues/ERGs)
+  async listQueues(serverId: string): Promise<any[]> {
+    const data = await this.request<any>('pbxware.erg.list', { server: serverId });
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      return Object.entries(data).map(([id, q]: [string, any]) => ({ id, ...q }));
+    }
+    return Array.isArray(data) ? data : [];
   }
 
-  async getQueue(tenantId: string, queueId: string): Promise<any> {
-    return this.request(`/api/queue/${queueId}`, { tenant: tenantId });
+  async getQueue(serverId: string, queueId: string): Promise<any> {
+    return this.request('pbxware.erg.members', { server: serverId, id: queueId });
   }
 
-  async listIVRs(tenantId: string): Promise<any[]> {
-    const data = await this.request<any>('/api/ivr', { tenant: tenantId });
-    return Array.isArray(data) ? data : data?.data || data?.ivrs || [];
+  // IVRs
+  async listIVRs(serverId: string): Promise<any[]> {
+    const data = await this.request<any>('pbxware.ivr.list', { server: serverId });
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      return Object.entries(data).map(([id, i]: [string, any]) => ({ id, ...i }));
+    }
+    return Array.isArray(data) ? data : [];
   }
 
-  async getIVR(tenantId: string, ivrId: string): Promise<any> {
-    return this.request(`/api/ivr/${ivrId}`, { tenant: tenantId });
+  async getIVR(serverId: string, ivrId: string): Promise<any> {
+    return this.request('pbxware.ivr.edit', { server: serverId, id: ivrId });
   }
 
-  async listDIDs(tenantId: string): Promise<any[]> {
-    const data = await this.request<any>('/api/did', { tenant: tenantId });
-    return Array.isArray(data) ? data : data?.data || data?.dids || [];
+  // DIDs
+  async listDIDs(serverId: string): Promise<any[]> {
+    const data = await this.request<any>('pbxware.did.list', { server: serverId });
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      return Object.entries(data).map(([id, d]: [string, any]) => ({ id, ...d }));
+    }
+    return Array.isArray(data) ? data : [];
   }
 
-  async getDID(tenantId: string, didId: string): Promise<any> {
-    return this.request(`/api/did/${didId}`, { tenant: tenantId });
+  async getDID(serverId: string, didId: string): Promise<any> {
+    return this.request('pbxware.did.edit', { server: serverId, id: didId });
+  }
+
+  // Operation times (business hours)
+  async getOperationTimes(serverId: string): Promise<any> {
+    return this.request('pbxware.otimes.servers.list', { server: serverId }).catch(() => null);
   }
 
   async ping(): Promise<boolean> {
