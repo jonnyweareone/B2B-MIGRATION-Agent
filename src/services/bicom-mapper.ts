@@ -255,7 +255,7 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
         const workflowSteps = wrapWithSchedule(baseSteps, otimes)
 
         const { data: flow, error } = await sb.from('call_flows').upsert({
-          org_id: target_org_id, name: rg.name, flow_type: 'ring_group',
+          org_id: target_org_id, name: rg.name, flow_type: 'hunt_group',
           entrypoint: 'start', is_active: true,
           settings: {
             extension: rg.ext, bicom_id: rg._id, bicom_tenant_id,
@@ -335,7 +335,7 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
         // DID points to bare extension -- auto-create a direct ring flow
         if (!callFlowId && did.type === 'Extension' && did.ext) {
           const { data: flow } = await sb.from('call_flows').upsert({
-            org_id: target_org_id, name: `Direct -- ${did.ext}`, flow_type: 'direct',
+            org_id: target_org_id, name: `Direct -- ${did.ext}`, flow_type: 'standard',
             entrypoint: 'start', is_active: true,
             settings: { extension: did.ext, bicom_tenant_id, migrated_at: new Date().toISOString() },
             workflow_steps: [
@@ -349,7 +349,7 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
 
         const { error } = await sb.from('phone_numbers').upsert({
           org_id: target_org_id, number: normalised,
-          label: did.name || normalised, number_type: 'geographic',
+          label: did.name || normalised, number_type: 'local',
           provider: 'gamma', status: 'active', is_active: true,
           voice_enabled: true, sms_enabled: false,
           call_flow_id: callFlowId,
