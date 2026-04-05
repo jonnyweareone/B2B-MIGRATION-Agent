@@ -399,7 +399,64 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
       logger.warn(`[BiCom] Trunk fetch skipped: ${e.message}`)
     }
 
-    // ── Step 7: Store pending invites -- NOT sent yet ──────────────────────────
+    // ── Step 7: Devices → sip_devices (pending_migration) ────────────────────
+    // Pre-populate from analysis so engineer can see what needs attention
+    // (missing SN, needs RPS update etc.) without having to re-analyse
+    let devicesSynced = 0
+    const { data: syncRow } = await sb.from('bicom_tenant_sync')
+      .select('pre_migration_analysis').eq('id', tenant_sync_id).single()
+    const analysisDevices: any[] = syncRow?.pre_migration_analysis?.devices || []
+
+    for (const dev of analysisDevices) {
+      if (!dev.ext) continue
+      try {
+        const orgUserId = extToOrgUserId[dev.ext] || null
+        const needsSn     = !dev.sn
+        const needsMac    = !dev.mac
+        const needsRps    = dev.sn && dev.mac   // has both — just needs RPS pointed at SONIQ
+        const statusFlag  = needsMac ? 'pending_mac'
+                          : needsSn  ? 'pending_sn'
+                          : 'pending_rps'
+
+        const { error } = await sb.from('sip_devices').upsert({
+          org_id:        target_org_id,
+          org_user_id:   orgUserId,
+          extension:     dev.ext,
+          name:          dev.name || `Ext ${dev.ext}`,
+          label:         dev.name || `Ext ${dev.ext}`,
+          model:         dev.model || null,
+          vendor:        (dev.model || '').toLowerCase().includes('yealink') ? 'yealink' : null,
+          mac_address:   dev.mac ? dev.mac.toUpperCase().replace(/(.{2})(?=.)/g, '$1:') : null,
+          machine_id:    dev.sn || null,        // serial number → machine_id
+          status:        'pending_migration',
+          rps_status:    needsRps ? 'needs_update' : 'not_registered',
+          last_seen_at:  dev.live_ip ? new Date().toISOString() : null,
+          ip_address:    dev.live_ip || null,
+          user_agent:    dev.live_ua || null,
+          settings: {
+            bicom_ext_id:    dev.bicom_id || null,
+            bicom_tenant_id: bicom_tenant_id,
+            migration_flags: {
+              needs_mac:  needsMac,
+              needs_sn:   needsSn,
+              needs_rps:  needsRps,
+              status:     statusFlag,
+            },
+            additional_macs:  dev.additional_macs || [],
+            bicom_live_status: dev.live_status || null,
+          },
+        }, { onConflict: 'org_id,extension', ignoreDuplicates: false })
+
+        if (error) throw new Error(error.message)
+        devicesSynced++
+        logger.info(`[BiCom] [OK] Device ext ${dev.ext} (${dev.model || 'unknown'}) → ${statusFlag}`)
+      } catch (e: any) {
+        logger.warn(`[BiCom] Device ext ${dev.ext}: ${e.message}`)
+      }
+    }
+    logger.info(`[BiCom] Devices: ${devicesSynced}/${analysisDevices.length} synced`)
+
+    // ── Step 8: Store pending invites -- NOT sent yet ──────────────────────────
     // Also track users needing real email (dummy/placeholder in BiCom)
     const needsEmail = extensions
       .filter(e => e.status !== '0' && isDummyEmail((e.email || '').trim()))
@@ -414,7 +471,7 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
       },
     }).eq('id', tenant_sync_id)
 
-    // ── Step 7: Mark complete ─────────────────────────────────────────────────
+    // ── Step 9: Mark complete ─────────────────────────────────────────────────
     const totalExpected = extensions.filter(e => e.email && e.status !== '0').length
       + ringGroups.length + ivrs.length
       + dids.filter((d: any) => d.status !== 'disabled').length
