@@ -25,6 +25,33 @@ function toArray(d: any): any[] {
   return Object.entries(d).map(([id, v]: [string, any]) => ({ _id: id, ...v }))
 }
 
+// Parse BLF config -- BiCom returns parallel arrays: exts[], labels[], functions[]
+// NOT a blfs[] object of {ext,label} pairs
+function parseBlfKeys(blfConf: any): Array<{extension: string; label: string; type: string; blf_enabled: boolean}> {
+  if (!blfConf) return []
+  const exts: string[] = blfConf.exts || []
+  const labels: string[] = blfConf.labels || []
+  const fns: string[] = blfConf.functions || []
+  const blfs: number[] = blfConf.blfs || []
+  return exts.map((ext: string, i: number) => ({
+    extension: ext,
+    label: labels[i] || ext,
+    type: fns[i] === '1' ? 'speed_dial' : 'presence',
+    blf_enabled: blfs[i] === 1,
+  }))
+}
+
+// Parse ES states response -- services that are 'yes' are enabled
+function parseEsStates(esStates: any): Record<string, boolean> {
+  if (!esStates || esStates.error) return {}
+  const result: Record<string, boolean> = {}
+  for (const [k, v] of Object.entries(esStates)) {
+    result[k] = v === 'yes' || v === true
+  }
+  return result
+}
+
+// ── Server health check ───────────────────────────────────────────────────────
 export async function runServerHealthCheck(serverUrl: string, apiKey: string) {
   const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
   const results: Record<string, any> = { checked_at: new Date().toISOString() }
@@ -61,35 +88,43 @@ export async function runServerHealthCheck(serverUrl: string, apiKey: string) {
   }
 }
 
-export async function editBicomExtension(
-  serverUrl: string, apiKey: string, tenantId: string,
-  bicomExtId: string, fields: Record<string, string>
-) {
+// ── Edit extension in BiCom ───────────────────────────────────────────────────
+export async function editBicomExtension(serverUrl: string, apiKey: string, tenantId: string, bicomExtId: string, fields: Record<string, string>) {
   const result = await bicomGet(serverUrl, apiKey, 'pbxware.ext.edit', tenantId, { id: bicomExtId, ...fields })
   if (!result.success) throw new Error(`Edit failed: ${JSON.stringify(result)}`)
   logger.info(`[BiCom] Edited ext ${bicomExtId}: ${JSON.stringify(fields)}`)
   return result
 }
 
-export async function editBicomDid(
-  serverUrl: string, apiKey: string, tenantId: string,
-  bicomDidId: string, fields: Record<string, string>
-) {
+// ── Edit DID in BiCom ─────────────────────────────────────────────────────────
+export async function editBicomDid(serverUrl: string, apiKey: string, tenantId: string, bicomDidId: string, fields: Record<string, string>) {
   const result = await bicomGet(serverUrl, apiKey, 'pbxware.did.edit', tenantId, { id: bicomDidId, ...fields })
   if (!result.success) throw new Error(`DID edit failed: ${JSON.stringify(result)}`)
   logger.info(`[BiCom] Edited DID ${bicomDidId}: ${JSON.stringify(fields)}`)
   return result
 }
 
+// ES services available on this system (skip ones that require optional modules)
+const ES_SERVICES = 'callfwd,callerid,followme,callfilters,dnd,callscreening,blflist,speeddial,callpickup,lastcaller,delrecordings,listenrecordings,remoteaccess,callmonitoring,extoperationtimes,operationtimes,smsnotifications'
+
+// ── Deep extension detail: config + BLF + caller IDs + call fwd + ES states ──
 async function getExtDetail(serverUrl: string, apiKey: string, tenantId: string, extId: string) {
-  const [conf, clidConf, blfConf, cfwdConf] = await Promise.all([
+  const [conf, clidConf, blfConf, cfwdConf, esStates] = await Promise.all([
     bicomGet(serverUrl, apiKey, 'pbxware.ext.configuration', tenantId, { id: extId })
       .then(d => Object.values(d)[0] as any).catch(() => null),
     bicomGet(serverUrl, apiKey, 'pbxware.ext.es.callerid.configuration', tenantId, { id: extId }).catch(() => null),
     bicomGet(serverUrl, apiKey, 'pbxware.ext.es.blflist.configuration', tenantId, { id: extId }).catch(() => null),
     bicomGet(serverUrl, apiKey, 'pbxware.ext.es.callfwd.configuration', tenantId, { id: extId }).catch(() => null),
+    bicomGet(serverUrl, apiKey, 'pbxware.ext.es.states.get', tenantId, { id: extId, services: ES_SERVICES }).catch(() => null),
   ])
   const opts = conf?.options || {}
+
+  // BLF: parallel arrays exts[]/labels[]/functions[] -- NOT a blfs object
+  const blf_keys = parseBlfKeys(blfConf)
+
+  // ES states: which enhanced services are enabled for this extension
+  const es_enabled = parseEsStates(esStates)
+
   return {
     mac: opts.mac || conf?.macaddress || null,
     sn: opts.sn || null,
@@ -114,23 +149,22 @@ async function getExtDetail(serverUrl: string, apiKey: string, tenantId: string,
         .filter(([k]) => k.startsWith('callerid:') && !k.endsWith(':privacy'))
         .reduce((acc: any, [k, v]) => { acc[k.replace('callerid:', '')] = v; return acc }, {}),
     },
-    blf_keys: (blfConf?.blfs || []).map((b: any) => ({
-      extension: b.ext || b.extension, label: b.name || b.label || b.ext, type: b.type || 'presence',
-    })),
+    blf_keys,  // Fixed: now correctly parsed from parallel arrays
     call_forward: cfwdConf ? {
       enabled: cfwdConf.enabled || [],
       destination: cfwdConf.destinations || null,
       timeout: cfwdConf.timeouts || null,
     } : null,
+    es_enabled, // All enabled enhanced services
   }
 }
 
-export async function analyseTenant(
-  tenantSyncId: string, serverUrl: string, apiKey: string, bicomTenantId: string
-) {
+// ── Full tenant analysis ──────────────────────────────────────────────────────
+export async function analyseTenant(tenantSyncId: string, serverUrl: string, apiKey: string, bicomTenantId: string) {
   const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-  const [rawExts, rawRings, rawIVRs, rawDIDs, tenantConf, tenantTrunks, allTrunks] = await Promise.all([
+  // Fetch everything in parallel
+  const [rawExts, rawRings, rawIVRs, rawDIDs, tenantConf, tenantTrunks, allTrunks, monitorData] = await Promise.all([
     bicomGet(serverUrl, apiKey, 'pbxware.ext.list', bicomTenantId),
     bicomGet(serverUrl, apiKey, 'pbxware.ring_group.list', bicomTenantId),
     bicomGet(serverUrl, apiKey, 'pbxware.ivr.list', bicomTenantId),
@@ -138,6 +172,7 @@ export async function analyseTenant(
     bicomGet(serverUrl, apiKey, 'pbxware.tenant.configuration', '1', { id: bicomTenantId }).catch(() => null),
     bicomGet(serverUrl, apiKey, 'pbxware.tenant.trunks.list', '1', { tenant: bicomTenantId }).catch(() => null),
     bicomGet(serverUrl, apiKey, 'pbxware.trunk.list', '1').catch(() => ({})),
+    bicomGet(serverUrl, apiKey, 'pbxware.monitor.list', bicomTenantId).catch(() => ({})),
   ])
 
   const extensions = toArray(rawExts).filter(e => e.status !== '0' && e.status !== 'disabled')
@@ -145,6 +180,7 @@ export async function analyseTenant(
   const ivrs = toArray(rawIVRs)
   const dids = toArray(rawDIDs)
 
+  // Trunk carrier map
   const trunkMap: Record<string, string> = {}
   const trunkCarrierMap: Record<string, string> = {}
   for (const [tid, t] of Object.entries(allTrunks as Record<string, any>)) {
@@ -155,11 +191,19 @@ export async function analyseTenant(
       : name.includes('voiceflex') ? 'voiceflex' : 'other'
   }
 
+  // Monitor data: live status, DND, IP, UA string
+  const monitorMap: Record<string, any> = {}
+  for (const [eid, mon] of Object.entries(monitorData as Record<string, any>)) {
+    monitorMap[eid] = mon
+  }
+
+  // Deep fetch per extension (BLF, caller IDs, ES states, device info)
   const extDetails: Record<string, any> = {}
   await Promise.all(extensions.map(async ext => {
     extDetails[ext._id] = await getExtDetail(serverUrl, apiKey, bicomTenantId, ext._id).catch(() => ({}))
   }))
 
+  // Operation times per IVR and ring group
   const ivrOtimes: Record<string, any> = {}
   const rgOtimes: Record<string, any> = {}
   await Promise.all([
@@ -173,24 +217,29 @@ export async function analyseTenant(
     }),
   ])
 
+  // Ring group configs
   const rgConfigs: Record<string, any> = {}
   await Promise.all(ringGroups.map(async rg => {
     const c = await bicomGet(serverUrl, apiKey, 'pbxware.ring_group.configuration', bicomTenantId, { id: rg._id }).catch(() => null)
     if (c) rgConfigs[rg._id] = (Object.values(c)[0] as any)?.options || {}
   }))
 
+  // Email analysis
   const emailMap: Record<string, any[]> = {}
   const emailIssues: any[] = []
 
+  // Build users with all detail
   const users = extensions.map(ext => {
     const email = (ext.email || '').trim().toLowerCase()
     if (!emailMap[email]) emailMap[email] = []
     emailMap[email].push({ ext: ext.ext, name: ext.name, bicom_id: ext._id })
     const detail = extDetails[ext._id] || {}
+    const monitor = monitorMap[ext._id] || {}
     return {
       bicom_id: ext._id, name: ext.name, ext: ext.ext,
       email: email || null, email_is_dummy: isDummy(email),
       phone_model: ext.ua_name || null, phone_model_full: ext.ua_fullname || null,
+      // Device from config (autoprov stored SN/MAC)
       mac: detail.mac || null, sn: detail.sn || null,
       additional_macs: detail.additional_macs || [],
       autoprov: detail.autoprov || false, dhcp: detail.dhcp !== false,
@@ -202,8 +251,15 @@ export async function analyseTenant(
       timezone: detail.timezone || 'Europe/London',
       codec_allow: detail.codec_allow || [],
       caller_id: detail.caller_id || null,
-      blf_keys: detail.blf_keys || [],
+      blf_keys: detail.blf_keys || [],  // Now correctly parsed
       call_forward: detail.call_forward || null,
+      es_enabled: detail.es_enabled || {},  // All enhanced service states
+      // Live monitor data
+      live_status: monitor.status || 'unknown',
+      live_ip: monitor.ip || null,
+      live_ua: monitor.ua || null,
+      live_dnd: !!monitor.dnd,
+      live_on_call: !!monitor.on_call,
     }
   })
 
@@ -218,8 +274,10 @@ export async function analyseTenant(
     model: u.phone_model_full || u.phone_model || 'Unknown',
     mac: u.mac, sn: u.sn, additional_macs: u.additional_macs,
     autoprov: u.autoprov, dhcp: u.dhcp,
+    live_status: u.live_status, live_ip: u.live_ip, live_ua: u.live_ua,
   }))
 
+  // DIDs with E.164 and carrier info
   const didList = dids.map(did => ({
     bicom_id: did._id, number: e164(did.number || ''), number_raw: did.number,
     label: did.name || null, type: did.type || 'Unknown',
@@ -229,6 +287,22 @@ export async function analyseTenant(
     status: did.status || 'enabled',
   }))
 
+  // IVRs with greeting file names
+  const ivrList = ivrs.map(ivr => {
+    const ot = ivrOtimes[ivr._id]
+    return {
+      bicom_id: ivr._id, name: ivr.name, ext: ivr.ext, type: 'ivr' as const,
+      key_count: ivr.keymap ? Object.keys(ivr.keymap).length : 0,
+      is_active: ivr.status !== 'disabled', operator: ivr.operator || null,
+      greeting: ivr.greeting || null,  // Greeting file name
+      keymap: ivr.keymap || {},
+      has_schedule: !!(ot && ot.status === 'on'),
+      schedule_closed_dates: ot?.closed_dates?.length || 0,
+      schedule_closed_dest: ot?.default_dest_ext || null,
+    }
+  })
+
+  // Ring groups
   const ringGroupList = ringGroups.map(rg => {
     const conf = rgConfigs[rg._id] || {}
     const ot = rgOtimes[rg._id]
@@ -239,23 +313,20 @@ export async function analyseTenant(
       members: memberExts, member_count: memberExts.length,
       overflow_ext: conf.last_dest || null, callerid_override: conf.callerid || null,
       record_calls: conf.record === '1',
+      greeting: conf.greeting || null,  // Ring group greeting if any
       has_schedule: !!(ot && ot.status === 'on'),
       schedule_closed_dates: ot?.closed_dates?.length || 0,
       schedule_closed_dest: ot?.default_dest_ext || null,
     }
   })
 
-  const ivrList = ivrs.map(ivr => {
-    const ot = ivrOtimes[ivr._id]
-    return {
-      bicom_id: ivr._id, name: ivr.name, ext: ivr.ext, type: 'ivr' as const,
-      key_count: ivr.keymap ? Object.keys(ivr.keymap).length : 0,
-      is_active: ivr.status !== 'disabled', operator: ivr.operator || null,
-      has_schedule: !!(ot && ot.status === 'on'),
-      schedule_closed_dates: ot?.closed_dates?.length || 0,
-      schedule_closed_dest: ot?.default_dest_ext || null,
-    }
-  })
+  // Directory = extensions list (BiCom has no separate phonebook API)
+  const directory = users.map(u => ({
+    ext: u.ext, name: u.name, email: u.email,
+    phone_model: u.phone_model_full || u.phone_model,
+    caller_id_number: u.caller_id?.default || null,
+    live_status: u.live_status,
+  }))
 
   const uadCounts: Record<string, number> = {}
   for (const u of users) {
@@ -275,9 +346,10 @@ export async function analyseTenant(
       needs_attention: emailIssues.length,
       devices_with_sn: users.filter(u => u.sn).length,
       devices_with_mac: users.filter(u => u.mac).length,
+      extensions_online: users.filter(u => u.live_status === 'online').length,
     },
     email_issues: emailIssues, uad_breakdown: uadCounts,
-    users, devices, dids: didList, ring_groups: ringGroupList, ivrs: ivrList,
+    users, devices, dids: didList, ring_groups: ringGroupList, ivrs: ivrList, directory,
     channel_info: tenantConf ? {
       incoming_limit: tenantConf.incominglimit, outgoing_limit: tenantConf.outgoinglimit,
       concurrent_calls: tenantConf.conch, queue_channels: tenantConf.quech,
@@ -298,6 +370,6 @@ export async function analyseTenant(
     .update({ pre_migration_analysis: analysis, analysis_run_at: analysis.analysed_at })
     .eq('id', tenantSyncId)
 
-  logger.info(`[Analysis] Tenant ${bicomTenantId}: ${users.length} users, ${users.filter(u => u.sn).length} SNs`)
+  logger.info(`[Analysis] Tenant ${bicomTenantId}: ${users.length} users, ${users.filter(u => u.blf_keys.length > 0).length} with BLF keys, ${users.filter(u => u.sn).length} SNs`)
   return analysis
 }
