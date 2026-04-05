@@ -202,14 +202,26 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
             email_note: hasDummyEmail ? `BiCom had dummy email "${rawEmail}" -- needs real email before invite` : null,
             migrated_at: new Date().toISOString(),
           },
-        }, { onConflict: 'org_id,user_id' }).select('id').single()
+        }, { onConflict: 'org_id,user_id', ignoreDuplicates: false }).select('id')
 
-        if (ouErr) throw new Error(`org_users: ${ouErr.message}`)
-        extToOrgUserId[ext.ext] = ou!.id
+        if (ouErr) throw new Error(`org_users upsert: ${ouErr.message} (code: ${(ouErr as any).code})`)
+        const orgUserId = (ou && ou.length > 0) ? ou[0].id : null
+        if (!orgUserId) {
+          // Fallback: fetch existing row if upsert returned nothing
+          const { data: existing } = await sb.from('org_users')
+            .select('id').eq('org_id', target_org_id).eq('user_id', userId).single()
+          if (existing) {
+            extToOrgUserId[ext.ext] = existing.id
+          } else {
+            throw new Error(`org_users: upsert returned no row and fetch also failed`)
+          }
+        } else {
+          extToOrgUserId[ext.ext] = orgUserId
+        }
         
         // Only queue invite for users with real emails
-        if (canInvite && authEmail) {
-          pendingInvites.push({ email: authEmail, display_name: ext.name, org_user_id: ou!.id })
+        if (canInvite && authEmail && extToOrgUserId[ext.ext]) {
+          pendingInvites.push({ email: authEmail, display_name: ext.name, org_user_id: extToOrgUserId[ext.ext] })
         }
         extensionsSynced++
         logger.info(`[BiCom] [OK] User ${ext.name} (ext ${ext.ext}) -- ${canInvite ? 'invite queued' : 'no real email, manual setup needed'}`)
