@@ -77,20 +77,38 @@ router.get('/tenants', async (req: Request, res: Response) => {
 
 // POST /bicom/capture-greetings -- place outbound calls to capture IVR greeting audio
 router.post('/capture-greetings', async (req: Request, res: Response) => {
-  const { tenant_sync_id, ivr_ids } = req.body
+  const { tenant_sync_id, server_url, api_key, bicom_tenant_id, ivr_ids, capture_ddi } = req.body
   if (!tenant_sync_id) return res.status(400).json({ error: 'tenant_sync_id required' })
   try {
     const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
     const { data: sync } = await sb.from('bicom_tenant_sync')
-      .select('pre_migration_analysis').eq('id', tenant_sync_id).single()
+      .select('pre_migration_analysis, server_id')
+      .eq('id', tenant_sync_id).single()
     if (!sync?.pre_migration_analysis) return res.status(404).json({ error: 'No analysis found -- run analyse first' })
+
+    // Get server creds if not provided directly
+    let sUrl = server_url, sKey = api_key, sTenantId = bicom_tenant_id
+    if (!sUrl && sync.server_id) {
+      const { data: srv } = await sb.from('bicom_servers').select('server_url,api_key').eq('id', sync.server_id).single()
+      if (srv) { sUrl = srv.server_url; sKey = srv.api_key }
+    }
+    if (!sUrl || !sKey) return res.status(400).json({ error: 'server_url and api_key required (or ensure server is linked to tenant sync)' })
+    if (!sTenantId) {
+      const { data: ts } = await sb.from('bicom_tenant_sync').select('bicom_tenant_id').eq('id', tenant_sync_id).single()
+      if (ts) sTenantId = ts.bicom_tenant_id
+    }
+    if (!sTenantId) return res.status(400).json({ error: 'bicom_tenant_id required' })
+
     const { ivrs = [], dids = [] } = sync.pre_migration_analysis
-    const ivrCount = ivrs.filter((i: any) => i.greeting).length
-    // Respond immediately -- capture takes ~40s per IVR
-    res.json({ ok: true, status: 'capturing', ivrs_with_greetings: ivrCount, message: `Capturing ${ivr_ids?.length || ivrCount} greeting(s) -- this takes ~${(ivr_ids?.length || ivrCount) * 45}s` })
+    const ivrCount = (ivr_ids ? ivrs.filter((i: any) => ivr_ids.includes(i.bicom_id)) : ivrs).filter((i: any) => i.greeting).length
+    const etaSecs = ivrCount * 50
+
+    // Respond immediately — capture is async
+    res.json({ ok: true, status: 'capturing', ivrs_with_greetings: ivrCount, eta_seconds: etaSecs, capture_ddi: capture_ddi || null })
+
     // Run captures in background
-    captureGreetings(tenant_sync_id, ivrs, dids, ivr_ids)
-      .then(results => logger.info(`[GreetingCapture] Complete: ${JSON.stringify(results.map(r => ({ name: r.ivr_name, status: r.status })))}`))
+    captureGreetings(tenant_sync_id, sUrl, sKey, sTenantId, ivrs, dids, capture_ddi || null, ivr_ids)
+      .then(r => logger.info(`[GreetingCapture] Done: ${JSON.stringify(r.map(x => ({ name: x.ivr_name, status: x.status, redirected: x.ddi_redirected })))}`))
       .catch(e => logger.error(`[GreetingCapture] Error: ${e.message}`))
   } catch (e: any) { res.status(500).json({ error: e.message }) }
 })
