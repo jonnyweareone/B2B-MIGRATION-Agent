@@ -168,7 +168,7 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
   const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
   // Fetch everything in parallel
-  const [rawExts, rawRings, rawIVRs, rawDIDs, tenantConf, tenantTrunks, allTrunks, monitorData] = await Promise.all([
+  const [rawExts, rawRings, rawIVRs, rawDIDs, tenantConf, tenantTrunks, allTrunks, monitorData, appsData] = await Promise.all([
     bicomGet(serverUrl, apiKey, 'pbxware.ext.list', bicomTenantId),
     bicomGet(serverUrl, apiKey, 'pbxware.ring_group.list', bicomTenantId),
     bicomGet(serverUrl, apiKey, 'pbxware.ivr.list', bicomTenantId),
@@ -177,6 +177,7 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
     bicomGet(serverUrl, apiKey, 'pbxware.tenant.trunks.list', '1', { tenant: bicomTenantId }).catch(() => null),
     bicomGet(serverUrl, apiKey, 'pbxware.trunk.list', '1').catch(() => ({})),
     bicomGet(serverUrl, apiKey, 'pbxware.monitor.list', bicomTenantId).catch(() => ({})),
+    bicomGet(serverUrl, apiKey, 'pbxware.apps.list', bicomTenantId).catch(() => ({})),
   ])
 
   const extensions = toArray(rawExts).filter(e => e.status !== '0' && e.status !== 'disabled')
@@ -185,6 +186,25 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
   const dids = toArray(rawDIDs)
 
   // Trunk carrier map
+  // Build apps map: which app types each extension has
+  // appsData = { BUSINESS: {total, in_use, extensions:[2001,2003,...]}, MOBILE: {...}, ... }
+  const appsPerExt: Record<string, string[]> = {}
+  const APP_TYPES = ['OFFICE', 'BUSINESS', 'WEB', 'MOBILE', 'AGENT', 'SUPERVISOR']
+  for (const appType of APP_TYPES) {
+    const appInfo = (appsData as any)[appType]
+    if (appInfo?.extensions) {
+      for (const extNum of appInfo.extensions) {
+        const key = String(extNum)
+        if (!appsPerExt[key]) appsPerExt[key] = []
+        appsPerExt[key].push(appType.toLowerCase())
+      }
+    }
+  }
+  const appsOverall = APP_TYPES.reduce((acc, t) => {
+    const info = (appsData as any)[t]
+    if (info) acc[t.toLowerCase()] = { total: info.total || 0, in_use: info.in_use || 0 }
+    return acc
+  }, {} as Record<string, any>)
   const trunkMap: Record<string, string> = {}
   const trunkCarrierMap: Record<string, string> = {}
   for (const [tid, t] of Object.entries(allTrunks as Record<string, any>)) {
@@ -201,10 +221,17 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
     monitorMap[eid] = mon
   }
 
-  // Deep fetch per extension (BLF, caller IDs, ES states, device info)
+  // Deep fetch per extension — also fetch editions_modules for app license detail
   const extDetails: Record<string, any> = {}
+  const extEditions: Record<string, any> = {}
   await Promise.all(extensions.map(async ext => {
-    extDetails[ext._id] = await getExtDetail(serverUrl, apiKey, bicomTenantId, ext._id).catch(() => ({}))
+    const [detail, editions] = await Promise.all([
+      getExtDetail(serverUrl, apiKey, bicomTenantId, ext._id).catch(() => ({})),
+      bicomGet(serverUrl, apiKey, 'pbxware.ext.editions_modules.configuration', bicomTenantId, { id: ext._id })
+        .catch(() => null),
+    ])
+    extDetails[ext._id] = detail
+    if (editions && !editions.error) extEditions[ext._id] = editions
   }))
 
   // Operation times per IVR and ring group
@@ -243,8 +270,10 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
       bicom_id: ext._id, name: ext.name, ext: ext.ext,
       email: email || null, email_is_dummy: isDummy(email),
       phone_model: ext.ua_name || null, phone_model_full: ext.ua_fullname || null,
-      // Device from config (autoprov stored SN/MAC)
-      mac: detail.mac || null, sn: detail.sn || null,
+      // Device: list call returns sn/macaddress directly (no autoprov needed)
+      // Fall back to getExtDetail options for autoprov-stored values
+      mac: ext.macaddress || detail.mac || null,
+      sn: ext.sn || detail.sn || null,
       additional_macs: detail.additional_macs || [],
       autoprov: detail.autoprov || false, dhcp: detail.dhcp !== false,
       sip_username: detail.sip_username || null,
@@ -255,9 +284,18 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
       timezone: detail.timezone || 'Europe/London',
       codec_allow: detail.codec_allow || [],
       caller_id: detail.caller_id || null,
-      blf_keys: detail.blf_keys || [],  // Now correctly parsed
+      blf_keys: detail.blf_keys || [],
       call_forward: detail.call_forward || null,
-      es_enabled: detail.es_enabled || {},  // All enhanced service states
+      es_enabled: detail.es_enabled || {},
+      // Apps: which gloCOM editions this extension has
+      apps: appsPerExt[ext.ext] || [],
+      editions: extEditions[ext._id] ? {
+        business: extEditions[ext._id].editions?.business === 1,
+        web: extEditions[ext._id].editions?.web === 1,
+        mobile: extEditions[ext._id].editions?.mobile === 1,
+        office: extEditions[ext._id].editions?.office === 1,
+        use_department_template: extEditions[ext._id].use_department_templates === '1',
+      } : null,
       // Live monitor data
       live_status: monitor.status || 'unknown',
       live_ip: monitor.ip || null,
@@ -366,6 +404,7 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
     },
     email_issues: emailIssues, uad_breakdown: uadCounts,
     users, devices, dids: didList, ring_groups: ringGroupList, ivrs: ivrList, directory,
+    apps: appsOverall,  // Tenant-level app license usage by type
     channel_info: tenantConf ? {
       incoming_limit: tenantConf.incominglimit, outgoing_limit: tenantConf.outgoinglimit,
       concurrent_calls: tenantConf.conch, queue_channels: tenantConf.quech,
