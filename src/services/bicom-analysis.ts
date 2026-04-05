@@ -26,19 +26,23 @@ function toArray(d: any): any[] {
 }
 
 // Parse BLF config -- BiCom returns parallel arrays: exts[], labels[], functions[]
-// NOT a blfs[] object of {ext,label} pairs
-function parseBlfKeys(blfConf: any): Array<{extension: string; label: string; type: string; blf_enabled: boolean}> {
+// labels[] entries are empty string when no custom label set -- use ext number as display label
+function parseBlfKeys(blfConf: any): Array<{extension: string; label: string; has_label: boolean; type: string; blf_enabled: boolean}> {
   if (!blfConf) return []
   const exts: string[] = blfConf.exts || []
   const labels: string[] = blfConf.labels || []
   const fns: string[] = blfConf.functions || []
   const blfs: number[] = blfConf.blfs || []
-  return exts.map((ext: string, i: number) => ({
-    extension: ext,
-    label: labels[i] || ext,
-    type: fns[i] === '1' ? 'speed_dial' : 'presence',
-    blf_enabled: blfs[i] === 1,
-  }))
+  return exts.map((ext: string, i: number) => {
+    const rawLabel = (labels[i] || '').trim()
+    return {
+      extension: ext,
+      label: rawLabel || ext,        // fall back to ext number as display label
+      has_label: rawLabel.length > 0, // true only if a custom label was set
+      type: fns[i] === '1' ? 'speed_dial' : 'presence',
+      blf_enabled: blfs[i] === 1,
+    }
+  })
 }
 
 // Parse ES states response -- services that are 'yes' are enabled
@@ -287,7 +291,7 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
     status: did.status || 'enabled',
   }))
 
-  // IVRs with greeting file names
+  // IVRs with greeting file names and full schedule detail
   const ivrList = ivrs.map(ivr => {
     const ot = ivrOtimes[ivr._id]
     return {
@@ -299,6 +303,18 @@ export async function analyseTenant(tenantSyncId: string, serverUrl: string, api
       has_schedule: !!(ot && ot.status === 'on'),
       schedule_closed_dates: ot?.closed_dates?.length || 0,
       schedule_closed_dest: ot?.default_dest_ext || null,
+      schedule: ot ? {
+        status: ot.status,
+        default_dest_ext: ot.default_dest_ext || null,
+        default_dest_is_vm: ot.default_dest_is_vm === 'yes',
+        closed_dates: (ot.closed_dates || []).map((cd: any) => ({
+          date_from: cd.date_from, date_to: cd.date_to,
+          time_from: cd.time_from, time_to: cd.time_to,
+          destination: cd.destination, description: cd.description || null,
+        })),
+        open_days: ot.open_days || [],
+        custom_destinations: ot.custom_destinations || [],
+      } : null,
     }
   })
 
