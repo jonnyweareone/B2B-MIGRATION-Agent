@@ -67,6 +67,37 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
     logger.info(`[BiCom] Starting migration -- tenant ${bicom_tenant_id} → org ${target_org_id}`)
     if (!dry_run) await updateSync('in_progress')
 
+    // ── Snapshot: capture pre-migration state for rollback ────────────────────
+    let snapshotId: string | null = null
+    if (!dry_run) {
+      const { data: syncSnap } = await sb.from('bicom_tenant_sync')
+        .select('pre_migration_analysis, bicom_tenant_name').eq('id', tenant_sync_id).single()
+
+      // Capture existing SONIQ state before we touch anything
+      const [existingUsers, existingFlows, existingNumbers, existingDevices] = await Promise.all([
+        sb.from('org_users').select('id,extension,display_name,email').eq('org_id', target_org_id),
+        sb.from('call_flows').select('id,name,flow_type').eq('org_id', target_org_id),
+        sb.from('phone_numbers').select('id,number').eq('org_id', target_org_id),
+        sb.from('sip_devices').select('id,extension,mac_address').eq('org_id', target_org_id),
+      ])
+
+      const { data: snap } = await sb.from('bicom_migration_snapshots').insert({
+        tenant_sync_id, bicom_tenant_id,
+        bicom_tenant_name: syncSnap?.bicom_tenant_name || bicom_tenant_id,
+        target_org_id,
+        pre_migration_analysis: syncSnap?.pre_migration_analysis || null,
+        soniq_state_before: {
+          org_users:     existingUsers.data  || [],
+          call_flows:    existingFlows.data  || [],
+          phone_numbers: existingNumbers.data || [],
+          sip_devices:   existingDevices.data || [],
+        },
+        triggered_by: 'migration_start',
+      }).select('id').single()
+      snapshotId = snap?.id || null
+      logger.info(`[BiCom] Snapshot created: ${snapshotId}`)
+    }
+
     // ── Step 1: Fetch all BiCom data ─────────────────────────────────────────
     const [rawExts, rawRings, rawIVRs, rawDIDs] = await Promise.all([
       bicomGet(server_url, api_key, 'pbxware.ext.list', bicom_tenant_id),
@@ -91,6 +122,14 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
     const pendingInvites: Array<{ email: string; display_name: string; org_user_id: string }> = []
     let extensionsSynced = 0
 
+    // Build analysis lookup by ext for rich data (BLF keys, CLIs, MAC, SN etc.)
+    // The analysis has correctly parsed parallel arrays and is the source of truth
+    const { data: syncRow0 } = await sb.from('bicom_tenant_sync')
+      .select('pre_migration_analysis').eq('id', tenant_sync_id).single()
+    const analysisUsers: any[] = syncRow0?.pre_migration_analysis?.users || []
+    const analysisByExt: Record<string, any> = {}
+    for (const u of analysisUsers) { if (u.ext) analysisByExt[u.ext] = u }
+
     for (const ext of extensions) {
       if (ext.status === '0' || ext.status === 'disabled') continue
       try {
@@ -106,33 +145,28 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
         if (hasDummyEmail) {
           logger.info(`[BiCom] Ext ${ext.ext} (${ext.name}) -- dummy/missing email "${rawEmail}", creating internal user only`)
         }
-        // Fetch full config, caller IDs, BLF keys, call forward -- in parallel
-        const [fullConf, clidConf, blfConf, cfwdConf] = await Promise.all([
-          bicomGet(server_url, api_key, 'pbxware.ext.configuration', bicom_tenant_id, { id: ext._id })
-            .then(d => Object.values(d)[0] as any).catch(() => null),
-          bicomGet(server_url, api_key, 'pbxware.ext.es.callerid.configuration', bicom_tenant_id, { id: ext._id }).catch(() => null),
-          bicomGet(server_url, api_key, 'pbxware.ext.es.blflist.configuration', bicom_tenant_id, { id: ext._id }).catch(() => null),
-          bicomGet(server_url, api_key, 'pbxware.ext.es.callfwd.configuration', bicom_tenant_id, { id: ext._id }).catch(() => null),
-        ])
-        const opts = fullConf?.options || {}
+        // Use analysis data (already fetched & parsed) rather than 4 extra BiCom API calls
+        const analysisUser = analysisByExt[ext.ext] || {}
 
-        const callerIdSettings = clidConf ? {
-          default_number: clidConf.default_callerid || clidConf.callerid || null,
-          allowed_numbers: Object.values(clidConf.allowed_callerids || {}).map((c: any) => ({
-            number: c.callerid, label: c.label, short_code: c.short_code || null,
-          })),
-          per_trunk: Object.entries(clidConf)
-            .filter(([k]) => k.startsWith('callerid:') && !k.endsWith(':privacy'))
-            .reduce((acc: any, [k, v]) => { acc[k.replace('callerid:', '')] = v; return acc }, {}),
-        } : null
-
-        const blfKeys = (blfConf?.blfs || []).map((b: any) => ({
-          extension: b.ext || b.extension, label: b.name || b.label || b.ext, type: b.type || 'presence',
+        // BLF keys — use analysis which has correctly parsed parallel arrays
+        const blfKeys = (analysisUser.blf_keys || []).map((b: any) => ({
+          extension: b.extension,
+          label: b.has_label ? b.label : null,
+          type: b.type || 'presence',
+          enabled: b.blf_enabled !== false,
         }))
 
-        const callForward = cfwdConf ? {
-          enabled: cfwdConf.enabled || [], destination: cfwdConf.destinations || null, timeout: cfwdConf.timeouts || null,
+        // Caller ID — use analysis caller_id object
+        const callerIdSettings = analysisUser.caller_id ? {
+          default_number: analysisUser.caller_id.default,
+          allowed_numbers: (analysisUser.caller_id.allowed || []).map((c: any) => ({
+            number: c.number, label: c.label, short_code: c.short_code || null,
+          })),
+          per_trunk: analysisUser.caller_id.per_trunk || {},
         } : null
+
+        const callForward = analysisUser.call_forward || null
+        const opts = { sn: analysisUser.sn, mac: analysisUser.mac }
 
         // Auth user handling:
         // - Real email: find existing or create -- supports login, invites
@@ -174,28 +208,32 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
 
         const { data: ou, error: ouErr } = await sb.from('org_users').upsert({
           org_id: target_org_id, user_id: userId,
-          email: authEmail || displayEmail,  // store real email if we have it
+          email: authEmail || displayEmail,
           display_name: ext.name, role: 'member', extension: ext.ext,
           department: ext.department || null,
-          caller_id_name: opts.callerid ? opts.callerid.split('<')[0].trim() : ext.name,
-          caller_id_number: clidConf?.default_callerid || opts.callerid?.match(/<(.+)>/)?.[1] || null,
-          voicemail_enabled: opts.voicemail === '1' || opts.voicemail === 1,
+          caller_id_name: ext.name,
+          caller_id_number: callerIdSettings?.default_number || null,
+          voicemail_enabled: true,
           voicemail_transcription: true,
-          dnd_enabled: false,
+          dnd_enabled: analysisUser.live_dnd || false,
           invite_token: null, phone_provisioned: false, onboarding_completed: false,
           settings: {
             bicom_id: ext._id, bicom_tenant_id,
-            phone_model: ext.ua_name || null, phone_model_full: ext.ua_fullname || null,
-            mac_address: fullConf?.macaddress || null, sip_username: opts.username || null,
-            incoming_limit: parseInt(opts.incominglimit || '3'),
-            outgoing_limit: parseInt(opts.outgoinglimit || '3'),
-            ring_timeout: parseInt(opts.ringtime || '30'),
-            timezone: opts.ext_timezone || 'Europe/London',
+            phone_model: analysisUser.phone_model || null,
+            phone_model_full: analysisUser.phone_model_full || null,
+            mac_address: analysisUser.mac || null,
+            serial_number: analysisUser.sn || null,
+            additional_macs: analysisUser.additional_macs || [],
+            sip_username: analysisUser.sip_username || null,
+            incoming_limit: analysisUser.incoming_limit || 3,
+            outgoing_limit: analysisUser.outgoing_limit || 3,
+            ring_timeout: analysisUser.ring_timeout || 30,
+            timezone: analysisUser.timezone || 'Europe/London',
             caller_id_settings: callerIdSettings,
             blf_keys: blfKeys.length > 0 ? blfKeys : null,
             call_forward: callForward,
-            codec_allow: opts.allow || ['ulaw', 'alaw'],
-            // Email status flags
+            codec_allow: analysisUser.codec_allow || ['ulaw', 'alaw'],
+            es_enabled: analysisUser.es_enabled || null,
             has_real_email: !!authEmail,
             bicom_email: displayEmail,
             can_invite: canInvite,
@@ -427,7 +465,7 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
           model:         dev.model || null,
           vendor:        (dev.model || '').toLowerCase().includes('yealink') ? 'yealink' : null,
           mac_address:   dev.mac ? dev.mac.toUpperCase().replace(/(.{2})(?=.)/g, '$1:') : null,
-          machine_id:    dev.sn || null,        // serial number → machine_id
+          machine_id:    dev.sn || null,
           status:        'pending_migration',
           rps_status:    needsRps ? 'needs_update' : 'not_registered',
           last_seen_at:  dev.live_ip ? new Date().toISOString() : null,
@@ -442,8 +480,18 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
               needs_rps:  needsRps,
               status:     statusFlag,
             },
-            additional_macs:  dev.additional_macs || [],
+            additional_macs:   dev.additional_macs || [],
             bicom_live_status: dev.live_status || null,
+            // BLF keys and settings from the user analysis
+            blf_keys: (analysisByExt[dev.ext]?.blf_keys || []).map((b: any) => ({
+              extension: b.extension,
+              label: b.has_label ? b.label : null,
+              type: b.type || 'presence',
+              enabled: b.blf_enabled !== false,
+            })),
+            caller_id_settings: analysisByExt[dev.ext]?.caller_id || null,
+            codec_allow: analysisByExt[dev.ext]?.codec_allow || null,
+            es_enabled: analysisByExt[dev.ext]?.es_enabled || null,
           },
         }, { onConflict: 'org_id,extension', ignoreDuplicates: false })
 
@@ -485,6 +533,28 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
     })
 
     logger.info(`[BiCom] [OK] ${status} (${totalSynced}/${totalExpected}) -- ${pendingInvites.length} invites pending review`)
+
+    // ── Update snapshot with result + rollback IDs ────────────────────────────
+    if (snapshotId) {
+      // Capture IDs of everything we just created so rollback can delete them precisely
+      const [newUsers, newFlows, newNumbers, newDevices] = await Promise.all([
+        sb.from('org_users').select('id').eq('org_id', target_org_id).gt('created_at', new Date(Date.now() - 600000).toISOString()),
+        sb.from('call_flows').select('id').eq('org_id', target_org_id).gt('created_at', new Date(Date.now() - 600000).toISOString()),
+        sb.from('phone_numbers').select('id').eq('org_id', target_org_id).gt('created_at', new Date(Date.now() - 600000).toISOString()),
+        sb.from('sip_devices').select('id').eq('org_id', target_org_id).gt('created_at', new Date(Date.now() - 600000).toISOString()),
+      ])
+      await sb.from('bicom_migration_snapshots').update({
+        migration_result: { status, extensionsSynced, ringsSynced, ivrsSynced, didsSynced, pendingInvites },
+        rollback_ids: {
+          org_user_ids:     (newUsers.data || []).map((r: any) => r.id),
+          call_flow_ids:    (newFlows.data || []).map((r: any) => r.id),
+          phone_number_ids: (newNumbers.data || []).map((r: any) => r.id),
+          sip_device_ids:   (newDevices.data || []).map((r: any) => r.id),
+        },
+      }).eq('id', snapshotId)
+      logger.info(`[BiCom] Snapshot updated with rollback IDs: ${snapshotId}`)
+    }
+
     return { status, extensionsSynced, ringsSynced, ivrsSynced, didsSynced, pendingInvites }
 
   } catch (e: any) {
