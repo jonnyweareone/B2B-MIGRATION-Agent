@@ -456,6 +456,13 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
                           : needsSn  ? 'pending_sn'
                           : 'pending_rps'
 
+        const modelLower = (dev.model || '').toLowerCase()
+        const deviceType = modelLower.includes('w6') || modelLower.includes('w5') || modelLower.includes('dect')
+          ? 'deskphone'  // DECT base stations count as deskphone
+          : modelLower.includes('soft') || !dev.mac
+          ? 'softphone'
+          : 'deskphone'  // default physical phones to deskphone
+
         const { error } = await sb.from('sip_devices').upsert({
           org_id:        target_org_id,
           org_user_id:   orgUserId,
@@ -463,6 +470,7 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
           name:          dev.name || `Ext ${dev.ext}`,
           label:         dev.name || `Ext ${dev.ext}`,
           model:         dev.model || null,
+          device_type:   deviceType,
           vendor:        (dev.model || '').toLowerCase().includes('yealink') ? 'yealink' : null,
           mac_address:   dev.mac ? dev.mac.toUpperCase().replace(/(.{2})(?=.)/g, '$1:') : null,
           machine_id:    dev.sn || null,
