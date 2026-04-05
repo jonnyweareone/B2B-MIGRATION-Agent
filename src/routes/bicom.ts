@@ -9,11 +9,11 @@ import axios from 'axios'
 const router = Router()
 
 router.post('/migrate', async (req: Request, res: Response) => {
-  const { tenant_sync_id, server_url, api_key, bicom_tenant_id, target_org_id } = req.body
-  if (!tenant_sync_id || !server_url || !api_key || !bicom_tenant_id)
-    return res.status(400).json({ error: 'Missing required fields' })
-  res.json({ ok: true, status: 'in_progress', tenant_sync_id })
-  migrateBicomTenant({ tenant_sync_id, server_url, api_key, bicom_tenant_id, target_org_id })
+  const { tenant_sync_id, server_url, api_key, bicom_tenant_id, target_org_id, dry_run } = req.body
+  if (!tenant_sync_id || !server_url || !api_key || !bicom_tenant_id || !target_org_id)
+    return res.status(400).json({ error: 'Missing required fields (tenant_sync_id, server_url, api_key, bicom_tenant_id, target_org_id)' })
+  res.json({ ok: true, status: dry_run ? 'dry_run_started' : 'in_progress', tenant_sync_id })
+  migrateBicomTenant({ tenant_sync_id, server_url, api_key, bicom_tenant_id, target_org_id, dry_run: !!dry_run })
     .catch(e => logger.error(`[BiCom] Migration failed: ${e.message}`))
 })
 
