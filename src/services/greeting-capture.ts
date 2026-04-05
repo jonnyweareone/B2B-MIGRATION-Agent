@@ -74,20 +74,18 @@ async function restoreDid(
   serverUrl: string, apiKey: string, tenantId: string, didId: string,
   origType: string, origExt: string
 ) {
-  // Map type string back to dest_type code
   const typeMap: Record<string, string> = {
-    'IVR': '3', 'Extension': '1', 'Ring Group': '1',
-    'Voicemail': '7', 'External Number': '5', 'Deny Access': '13',
-    'Multi User': '1',
+    'IVR': '3', 'Extension': '1', 'Ring Group': '1', 'Multi User': '1',
+    'Voicemail': '7', 'External Number': '5',
+    'Fax to E-mail': '11', 'Deny Access': '13', '-': '13',
   }
-  const destType = typeMap[origType] || '3'
+  const destType = typeMap[origType] || '13'
   const params: Record<string, string> = {
     action: 'pbxware.did.edit', server: tenantId,
-    id: didId, dest_type: destType,
+    id: didId, dest_type: destType, destination: origExt || '',
   }
-  if (origExt) params.destination = origExt
   await bicomGet(serverUrl, apiKey, params)
-  logger.info(`[GreetingCapture] DID ${didId} restored → ${origType} ${origExt}`)
+  logger.info(`[GreetingCapture] DID ${didId} restored → ${origType || 'Deny Access'} "${origExt}"`)
 }
 
 /** E.164 normalise a UK number */
@@ -146,13 +144,23 @@ export async function captureGreetings(
   let redirectDid: { id: string; number: string; orig_type: string; orig_ext: string } | null = null
 
   if (captureDdi) {
-    // User specified a spare DDI — find it in the did list
-    const spare = dids.find(d =>
-      d.number.replace(/\D/g,'').includes(captureDdi.replace(/\D/g,'')) ||
-      (d.number_raw || '').replace(/\D/g,'').includes(captureDdi.replace(/\D/g,''))
-    )
+    // User specified a spare DDI number — find it in the did list by number match
+    const normalised = captureDdi.replace(/\D/g, '')
+    const spare = dids.find(d => {
+      const n = (d.number_raw || d.number || '').replace(/\D/g, '')
+      return n === normalised || n.endsWith(normalised) || normalised.endsWith(n)
+    })
     if (spare) {
-      redirectDid = { id: spare.bicom_id, number: toE164(spare.number), orig_type: spare.type, orig_ext: spare.destination_ext || '' }
+      // Store the actual current type/ext for accurate restore
+      redirectDid = {
+        id: spare.bicom_id,
+        number: toE164(spare.number_raw || spare.number),
+        orig_type: spare.type || 'Deny Access',
+        orig_ext: spare.destination_ext || '',
+      }
+      logger.info(`[GreetingCapture] Spare DDI found: DID ${spare.bicom_id} (${redirectDid.number}), currently ${spare.type}`)
+    } else {
+      logger.warn(`[GreetingCapture] Spare DDI ${captureDdi} not found in tenant DID list — re-run analyse to refresh, or add it to the tenant first`)
     }
   }
 
