@@ -282,6 +282,7 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
               extension: ext.ext,
               username: sipUsername,
               password_hash: hashData,
+              password_plain: sipPassword,   // stored for provisioning route
               display_name: ext.name,
               realm: SIP_REALM,
               enabled: true,
