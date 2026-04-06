@@ -122,6 +122,11 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
     const pendingInvites: Array<{ email: string; display_name: string; org_user_id: string }> = []
     let extensionsSynced = 0
 
+    // Fetch org slug for SIP username generation ({ext}.{slug})
+    const { data: orgData } = await sb.from('orgs').select('slug').eq('id', target_org_id).single()
+    const orgSlug = orgData?.slug || 'soniq'
+    const SIP_REALM = 'sip.soniqlabs.co.uk'
+
     // Build analysis lookup by ext for rich data (BLF keys, CLIs, MAC, SN etc.)
     // The analysis has correctly parsed parallel arrays and is the source of truth
     const { data: syncRow0 } = await sb.from('bicom_tenant_sync')
@@ -262,6 +267,31 @@ export async function migrateBicomTenant(params: MigrationParams): Promise<Migra
           pendingInvites.push({ email: authEmail, display_name: ext.name, org_user_id: extToOrgUserId[ext.ext] })
         }
         extensionsSynced++
+
+        // ── Auto-generate SIP credentials with org slug ──────────────────────
+        // Pattern: {extension}.{org-slug} e.g. 2001.value-communications-578
+        try {
+          const sipUsername = `${ext.ext}.${orgSlug}`
+          const sipPassword = Array.from(crypto.getRandomValues(new Uint8Array(12)))
+            .map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 20)
+          const { data: hashData } = await sb.rpc('crypt_password', { plain_password: sipPassword })
+          if (hashData) {
+            await sb.from('sip_credentials').upsert({
+              org_id: target_org_id,
+              org_user_id: extToOrgUserId[ext.ext],
+              extension: ext.ext,
+              username: sipUsername,
+              password_hash: hashData,
+              display_name: ext.name,
+              realm: SIP_REALM,
+              enabled: true,
+            }, { onConflict: 'org_id,extension' })
+            logger.info(`[BiCom] SIP credential: ${sipUsername}@${SIP_REALM}`)
+          }
+        } catch (sipErr: any) {
+          logger.warn(`[BiCom] SIP credential failed for ext ${ext.ext}: ${sipErr.message}`)
+        }
+
         logger.info(`[BiCom] [OK] User ${ext.name} (ext ${ext.ext}) -- ${canInvite ? 'invite queued' : 'no real email, manual setup needed'}`)
       } catch (e: any) { logger.warn(`[BiCom] Ext ${ext.ext}: ${e.message}`) }
     }
