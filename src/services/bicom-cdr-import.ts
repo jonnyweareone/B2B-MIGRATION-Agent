@@ -103,6 +103,13 @@ function mergeLegs(legs: RawRow[]): RawRow | null {
     }
   }
 
+  // Edge case: no PSTN legs and no extension legs (empty/weird row) — skip
+  if (pstnLegs.length === 0 && internalLegs.length === 0) return null
+
+  // Edge case: all-internal legs where To is also an extension (internal transfer) — skip
+  if (pstnLegs.length === 0 && internalLegs.length > 0 &&
+      isExtension(String(internalLegs[0]['To'] || ''))) return null
+
   // Inbound: master = PSTN leg with best status/duration
   // Deduplicate exact-same UniqueIDs, then pick the one with Answered or max duration
   const uniquePstn = Array.from(
@@ -110,6 +117,8 @@ function mergeLegs(legs: RawRow[]): RawRow | null {
       `${r['Unique ID']}::${r['Status']}::${r['Total Duration']}`, r
     ])).values()
   )
+  if (uniquePstn.length === 0) return null   // nothing to work with
+
   const masterPstn = uniquePstn.sort((a, b) => {
     // Prefer Answered, then longest duration
     const aAns = a['Status'] === 'Answered' ? 1 : 0
