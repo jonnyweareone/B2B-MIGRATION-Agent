@@ -296,20 +296,31 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
         })
       }
 
-      // Upsert in batches of 200
+      // Insert in batches of 200.
+      // NOTE: Supabase ignoreDuplicates:true breaks with partial unique indexes,
+      // so we use plain insert and handle error code 23505 (unique_violation).
       let batchErrors = 0
       for (let i = 0; i < records.length; i += 200) {
         const batch = records.slice(i, i + 200)
-        const { error } = await sb
-          .from('call_logs')
-          .upsert(batch, { onConflict: 'org_id,source_id', ignoreDuplicates: true })
+        const { error } = await sb.from('call_logs').insert(batch)
         if (error) {
-          logger.warn(`[CDR] Batch upsert error at offset ${i}: ${error.message}`)
-          batchErrors++
+          if ((error as any).code === '23505') {
+            // Batch contains duplicates — retry one-by-one to maximise inserts
+            for (const rec of batch) {
+              const { error: e2 } = await sb.from('call_logs').insert(rec)
+              if (e2 && (e2 as any).code !== '23505') {
+                logger.warn(`[CDR] Insert error: ${e2.message}`)
+                batchErrors++
+              }
+            }
+          } else {
+            logger.warn(`[CDR] Batch insert error at offset ${i}: ${error.message}`)
+            batchErrors++
+          }
         }
       }
 
-      if (batchErrors > 0) logger.warn(`[CDR] ${batchErrors} batch errors during upsert`)
+      if (batchErrors > 0) logger.warn(`[CDR] ${batchErrors} non-duplicate errors during insert`)
 
       // True count from DB
       const { count } = await sb
