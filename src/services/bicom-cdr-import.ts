@@ -157,20 +157,17 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
           }
         })
 
-        // Upsert in batches of 200
+        // Upsert in batches of 200 — on conflict (duplicate source_id) do nothing
         for (let i = 0; i < records.length; i += 200) {
           const batch = records.slice(i, i + 200)
-          const { data: inserted, error } = await sb
+          const { error } = await sb
             .from('call_logs')
             .upsert(batch, { onConflict: 'org_id,source_id', ignoreDuplicates: true })
-            .select('id')
 
           if (error) {
             logger.warn(`[CDR] Batch error page ${pageNum}: ${error.message}`)
-          } else {
-            totalInserted += inserted?.length || 0
-            totalSkipped  += batch.length - (inserted?.length || 0)
           }
+          // Note: ignoreDuplicates suppresses returned rows — we get final count via DB query below
         }
       } else {
         totalInserted += rows.length
@@ -185,6 +182,14 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
         hasMore = false
       }
     }
+
+    // Get actual inserted count from DB
+    const { count } = await sb
+      .from('call_logs')
+      .select('*', { count: 'exact', head: true })
+      .eq('org_id', soniq_org_id)
+      .eq('source', 'bicom_import')
+    totalInserted = count ?? totalFetched
 
     await sb.from('bicom_tenant_sync').update({
       cdr_import_status:       'complete',
