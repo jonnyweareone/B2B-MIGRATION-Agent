@@ -65,6 +65,8 @@ export class VodiaClient {
   // type: extensions | auto_attendants | acd | vmgroups | agents | ivr
   async listAccounts(domain: string, type: string = 'extensions'): Promise<any[]> {
     const data = await this.get<any>(`/rest/domain/${domain}/userlist/${type}`);
+    // Vodia returns { action: 'domain-list', accounts: [...] }
+    if (data && data.accounts && Array.isArray(data.accounts)) return data.accounts;
     if (Array.isArray(data)) return data;
     if (data && typeof data === 'object') return Object.values(data);
     return [];

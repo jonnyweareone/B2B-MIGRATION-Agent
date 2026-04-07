@@ -93,11 +93,13 @@ export async function migrateVodiaDomain(params: VodiaMigrationParams): Promise<
       if (!account) continue
 
       try {
-        // Fetch full settings for this extension
+        // Fetch full settings for richer data (MAC, call fwd detail)
         const settings = await client.getUserSettings(vodia_domain, account).catch(() => ({}))
-        const email = ((settings.email || ext.email || '')).trim().toLowerCase()
-        const displayName = [settings.first_name || ext.first_name, settings.last_name || ext.last_name]
-          .filter(Boolean).join(' ') || `Ext ${account}`
+        const email = ((ext.email || settings.email || '')).trim().toLowerCase()
+        // Vodia userlist has 'name' field; user_settings has first_name/last_name
+        const displayName = ext.name ||
+          [settings.first_name, settings.last_name].filter(Boolean).join(' ') ||
+          `Ext ${account}`
         const hasRealEmail = !isDummyEmail(email)
         const authEmail = hasRealEmail ? email : null
 
@@ -439,19 +441,21 @@ export async function analyseVodiaDomain(
   const users = await Promise.all(
     extensions.slice(0, 100).map(async (ext: any) => {
       const account = ext.account || ext.account_ext || ext.id
-      const settings = await client.getUserSettings(vodia_domain, account).catch(() => ({}))
-      const email = (settings.email || ext.email || '').trim().toLowerCase()
+      // Vodia userlist already includes most fields — skip individual user_settings call
+      // unless we need deeper config (call forward detail etc)
+      const email = (ext.email || '').trim().toLowerCase()
+      const displayName = ext.name || `Ext ${account}`
       return {
         account,
-        display_name: [settings.first_name, settings.last_name].filter(Boolean).join(' ') || `Ext ${account}`,
+        display_name: displayName,
         email: email || null,
         has_real_email: !isDummyEmail(email),
-        mac: settings.mac || null,
-        voicemail: settings.no_vpa !== 'true',
-        dnd: settings.dnd === 'true',
-        cfa: settings.cfa || null,
-        ani: settings.ani || null,
-        cell: settings.cell || null,
+        mac: null, // not in userlist — would need user_settings call
+        voicemail: ext.vm !== 'disabled',
+        dnd: ext.dnd === true || ext.dnd === 'true',
+        cfa: ext.cfa || null,
+        ani: ext.ani || null,
+        cell: ext.cell || null,
       }
     })
   )
