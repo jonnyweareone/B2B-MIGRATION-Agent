@@ -22,7 +22,10 @@ export class VodiaClient {
       timeout: 30000,
       headers: { Authorization: basicAuth },
       // Allow self-signed certs on local/test instances
-      httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false }),
+      httpsAgent: new (require('https').Agent)({
+        rejectUnauthorized: false,
+        secureOptions: require('constants').SSL_OP_LEGACY_SERVER_CONNECT,
+      }),
     });
   }
 
