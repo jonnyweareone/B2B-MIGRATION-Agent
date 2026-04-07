@@ -152,10 +152,10 @@ router.post('/import-cdrs', async (req, res) => {
     if (!tenantId)      return res.status(400).json({ error: 'bicom_tenant_id missing on sync row' })
     if (!orgId)         return res.status(400).json({ error: 'soniq_org_id missing on sync row' })
 
-    // Respond immediately — import runs in background
-    res.json({ ok: true, status: 'importing', tenant_sync_id, months_back, dry_run })
-
-    importBicomCdrs({ tenant_sync_id, server_url: sUrl, api_key: sKey, bicom_tenant_id: tenantId, soniq_org_id: orgId, months_back, dry_run })
+    // Run synchronously so Railway doesn't kill the process before completion
+    // (fire-and-forget was failing silently on Railway)
+    const result = await importBicomCdrs({ tenant_sync_id, server_url: sUrl, api_key: sKey, bicom_tenant_id: tenantId, soniq_org_id: orgId, months_back, dry_run })
+    res.json({ ok: true, status: result.status, ...result })
       .then(r => logger.info(`[CDR] Import complete: ${JSON.stringify(r)}`))
       .catch(e => logger.error(`[CDR] Import error: ${e.message}`))
 
