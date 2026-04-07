@@ -7,9 +7,10 @@
 import axios from 'axios'
 import crypto from 'crypto'
 
-const VODIA_URL  = process.env.VODIA_URL  || 'http://localhost:8080'
-const VODIA_USER = process.env.VODIA_USER || 'admin'
-const VODIA_PASS = process.env.VODIA_PASS || 'admin'
+// AWS Marketplace default: user=ec2, password=EC2_INSTANCE_ID
+const VODIA_URL  = process.env.VODIA_URL  || 'https://localhost'
+const VODIA_USER = process.env.VODIA_USER || 'ec2'
+const VODIA_PASS = process.env.VODIA_PASS || '' // set to EC2 instance ID e.g. i-0abc1234def56789
 
 class VodiaSeeder {
   private http: any
