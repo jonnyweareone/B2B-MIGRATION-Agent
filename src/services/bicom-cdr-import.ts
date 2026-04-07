@@ -7,7 +7,7 @@ export interface CdrImportParams {
   server_url: string
   api_key: string
   bicom_tenant_id: string   // BiCom server/tenant numeric ID e.g. "578"
-  target_org_id: string
+  soniq_org_id: string
   months_back?: number      // default 12
   dry_run?: boolean
 }
@@ -76,7 +76,7 @@ async function fetchCdrPage(
 export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImportResult> {
   const {
     tenant_sync_id, server_url, api_key, bicom_tenant_id,
-    target_org_id, months_back = 12, dry_run = false,
+    soniq_org_id, months_back = 12, dry_run = false,
   } = params
 
   const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -88,7 +88,7 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
   const startStr = formatBicomDate(dateFrom)
   const endStr   = formatBicomDate(dateTo)
 
-  logger.info(`[CDR] ${bicom_tenant_id} → org ${target_org_id} | ${startStr}→${endStr} | dry_run=${dry_run}`)
+  logger.info(`[CDR] ${bicom_tenant_id} → org ${soniq_org_id} | ${startStr}→${endStr} | dry_run=${dry_run}`)
 
   // Mark in_progress
   await sb.from('bicom_tenant_sync').update({
@@ -141,7 +141,7 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
             : null
 
           return {
-            org_id:              target_org_id,
+            org_id:              soniq_org_id,
             source:              'bicom_import',
             source_id:           uniqueId,
             bicom_tenant_id,

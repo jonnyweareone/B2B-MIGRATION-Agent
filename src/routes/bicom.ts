@@ -123,7 +123,7 @@ router.post('/import-cdrs', async (req, res) => {
     // Load sync row to get server creds + org
     const { data: sync } = await sb
       .from('bicom_tenant_sync')
-      .select('id, bicom_tenant_id, target_org_id, server_id, bicom_servers(server_url, api_key)')
+      .select('id, bicom_tenant_id, soniq_org_id, server_id, bicom_servers(server_url, api_key)')
       .eq('id', tenant_sync_id)
       .single()
     if (!sync) return res.status(404).json({ error: 'tenant_sync not found' })
@@ -131,17 +131,17 @@ router.post('/import-cdrs', async (req, res) => {
     const sUrl     = (sync as any).bicom_servers?.server_url
     const sKey     = (sync as any).bicom_servers?.api_key
     const tenantId = sync.bicom_tenant_id
-    const orgId    = sync.target_org_id
+    const orgId    = (sync as any).soniq_org_id
 
     if (!sUrl || !sKey) return res.status(400).json({ error: 'No server credentials linked to this tenant sync' })
     if (!tenantId)      return res.status(400).json({ error: 'bicom_tenant_id missing on sync row' })
-    if (!orgId)         return res.status(400).json({ error: 'target_org_id missing on sync row' })
+    if (!orgId)         return res.status(400).json({ error: 'soniq_org_id missing on sync row' })
 
     // Respond immediately, run in background
     res.json({ ok: true, status: 'importing', tenant_sync_id, months_back, dry_run })
 
     const { importBicomCdrs } = await import('../services/bicom-cdr-import')
-    importBicomCdrs({ tenant_sync_id, server_url: sUrl, api_key: sKey, bicom_tenant_id: tenantId, target_org_id: orgId, months_back, dry_run })
+    importBicomCdrs({ tenant_sync_id, server_url: sUrl, api_key: sKey, bicom_tenant_id: tenantId, soniq_org_id: orgId, months_back, dry_run })
       .then(r => logger.info(`[CDR] Import complete: ${JSON.stringify(r)}`))
       .catch(e => logger.error(`[CDR] Import error: ${e.message}`))
 
