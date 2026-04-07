@@ -5,44 +5,38 @@
  * Usage: VODIA_URL=https://your-vodia.aws.com VODIA_USER=admin VODIA_PASS=xxx tsx scripts/vodia-seed.ts
  */
 import axios from 'axios'
-import crypto from 'crypto'
+import https from 'https'
 
-// AWS Marketplace default: user=ec2, password=EC2_INSTANCE_ID
-const VODIA_URL  = process.env.VODIA_URL  || 'https://localhost'
-const VODIA_USER = process.env.VODIA_USER || 'ec2'
-const VODIA_PASS = process.env.VODIA_PASS || '' // set to EC2 instance ID e.g. i-0abc1234def56789
+// API admin account: soniqapi / S0n1qAPI2026! (API access enabled in Vodia)
+const VODIA_URL  = process.env.VODIA_URL  || 'https://35.179.93.96'
+const VODIA_USER = process.env.VODIA_USER || 'soniqapi'
+const VODIA_PASS = process.env.VODIA_PASS || 'S0n1qAPI2026!'
 
 class VodiaSeeder {
   private http: any
-  private sessionId: string | null = null
-  constructor() { this.http = axios.create({ baseURL: VODIA_URL, timeout: 15000 }) }
-
-  async login() {
-    const hash = crypto.createHash('md5').update(VODIA_PASS).digest('hex')
-    const r = await this.http.put('/rest/system/session', JSON.stringify({ name: 'auth', value: `${VODIA_USER} ${hash}` }), {
-      headers: { 'Content-Type': 'application/json' }, maxRedirects: 0, validateStatus: (s: number) => s < 400,
+  constructor() {
+    this.http = axios.create({
+      baseURL: VODIA_URL,
+      timeout: 15000,
+      headers: { Authorization: 'Basic ' + Buffer.from(`${VODIA_USER}:${VODIA_PASS}`).toString('base64') },
+      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
     })
-    const setCookie = r.headers['set-cookie']
-    if (setCookie) {
-      const str = Array.isArray(setCookie) ? setCookie.join('; ') : setCookie
-      const m = str.match(/session=([^;]+)/)
-      if (m) { this.sessionId = m[1]; return }
-    }
-    const bodyStr = typeof r.data === 'string' ? r.data : JSON.stringify(r.data)
-    const m = bodyStr.match(/"?([a-zA-Z0-9]{10,30})"?/)
-    if (m) { this.sessionId = m[1]; return }
-    throw new Error(`Login failed: ${JSON.stringify(r.data)}`)
   }
 
-  private h() { return { Cookie: `session=${this.sessionId}`, 'Content-Type': 'application/json' } }
+  async login() {
+    await this.http.get('/rest/system/session')
+    console.log('   ✓ Basic auth OK')
+  }
 
   async put(path: string, data: any) {
-    const r = await this.http.put(path, JSON.stringify(data), { headers: this.h(), validateStatus: (s: number) => s < 500 })
+    const r = await this.http.put(path, JSON.stringify(data), {
+      headers: { 'Content-Type': 'application/json' }, validateStatus: (s: number) => s < 500,
+    })
     return r.data
   }
 
   async get(path: string) {
-    const r = await this.http.get(path, { headers: this.h() })
+    const r = await this.http.get(path)
     return r.data
   }
 

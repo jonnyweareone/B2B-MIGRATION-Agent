@@ -1,7 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 
-// Vodia REST API
-// Auth: session cookie from POST /rest/system/session with MD5 password hash
+// Vodia REST API — Basic auth
+// Requires: admin account with "API access" set to Enabled in Vodia admin UI
 // Base: https://{host}/rest/...
 // Domains:    GET  /rest/system/domains
 // Users:      GET  /rest/domain/{domain}/userlist/extensions
@@ -10,54 +10,34 @@ import axios, { AxiosInstance } from 'axios';
 // Dial plans: GET  /rest/domain/{domain}/dialplans/
 // AAs:        GET  /rest/domain/{domain}/userlist/auto_attendants
 
-import crypto from 'crypto';
-
 export class VodiaClient {
   private base: string;
-  private username: string;
-  private password: string;
-  private sessionId: string | null = null;
   private http: AxiosInstance;
 
   constructor(serverUrl: string, username: string, password: string) {
     this.base = serverUrl.replace(/\/$/, '');
-    this.username = username;
-    this.password = password;
-    this.http = axios.create({ baseURL: this.base, timeout: 30000 });
+    const basicAuth = 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64');
+    this.http = axios.create({
+      baseURL: this.base,
+      timeout: 30000,
+      headers: { Authorization: basicAuth },
+      // Allow self-signed certs on local/test instances
+      httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false }),
+    });
   }
 
   async login(): Promise<void> {
-    const passwordHash = crypto.createHash('md5').update(this.password).digest('hex');
-    const body = JSON.stringify({ name: 'auth', value: `${this.username} ${passwordHash}` });
-    const r = await this.http.put('/rest/system/session', body, {
-      headers: { 'Content-Type': 'application/json' },
-      maxRedirects: 0,
-      validateStatus: s => s < 400,
-    });
-    // Session ID returned in body or Set-Cookie header
-    const setCookie = r.headers['set-cookie'] as string | string[] | undefined;
-    if (setCookie) {
-      const cookieStr = Array.isArray(setCookie) ? setCookie.join('; ') : setCookie;
-      const match = cookieStr.match(/session=([^;]+)/);
-      if (match) { this.sessionId = match[1]; return; }
-    }
-    // Some versions return session ID directly in body
-    const bodyStr = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
-    const bodyMatch = bodyStr.match(/"?([a-zA-Z0-9]{10,30})"?/);
-    if (bodyMatch) { this.sessionId = bodyMatch[1]; return; }
-    throw new Error('Vodia login failed — no session ID received');
+    // Verify connectivity — Basic auth, no session needed
+    await this.get('/rest/system/session');
   }
 
   private async get<T>(path: string): Promise<T> {
-    if (!this.sessionId) await this.login();
-    const r = await this.http.get<T>(path, {
-      headers: { Cookie: `session=${this.sessionId}` },
-    });
+    const r = await this.http.get<T>(path);
     return r.data;
   }
 
   async ping(): Promise<boolean> {
-    await this.login();
+    await this.get('/rest/system/session');
     return true;
   }
 
