@@ -35,11 +35,10 @@ export class VodiaClient {
       validateStatus: s => s < 400,
     });
     // Session ID returned in body or Set-Cookie header
-    const setCookie = r.headers['set-cookie'];
+    const setCookie = r.headers['set-cookie'] as string | string[] | undefined;
     if (setCookie) {
-      const match = Array.isArray(setCookie)
-        ? setCookie.join('; ').match(/session=([^;]+)/)
-        : setCookie.match(/session=([^;]+)/);
+      const cookieStr = Array.isArray(setCookie) ? setCookie.join('; ') : setCookie;
+      const match = cookieStr.match(/session=([^;]+)/);
       if (match) { this.sessionId = match[1]; return; }
     }
     // Some versions return session ID directly in body

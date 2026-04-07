@@ -369,7 +369,7 @@ export async function migrateVodiaDomain(params: VodiaMigrationParams): Promise<
 
     // ── Step 5: Store trunks for reference ────────────────────────────────────
     for (const trunk of trunks) {
-      await sb.from('vodia_trunk_reference').upsert({
+      const { error: trunkErr } = await sb.from('vodia_trunk_reference').upsert({
         tenant_sync_id,
         vodia_domain,
         trunk_id: trunk.id,
@@ -379,7 +379,8 @@ export async function migrateVodiaDomain(params: VodiaMigrationParams): Promise<
         registrar: trunk.registrar || null,
         account: trunk.account || null,
         raw_config: trunk,
-      }, { onConflict: 'tenant_sync_id,trunk_id', ignoreDuplicates: true }).catch(() => {})
+      }, { onConflict: 'tenant_sync_id,trunk_id', ignoreDuplicates: true })
+      if (trunkErr) logger.warn(`[Vodia] Trunk ref upsert: ${trunkErr.message}`)
     }
 
     // ── Step 6: Store pending invites + complete ───────────────────────────────
