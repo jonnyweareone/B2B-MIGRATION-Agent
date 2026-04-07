@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { migrateBicomTenant } from '../services/bicom-mapper'
 import { runServerHealthCheck, analyseTenant, editBicomExtension, editBicomDid } from '../services/bicom-analysis'
 import { captureGreetings } from '../services/greeting-capture'
+import { importBicomCdrs } from '../services/bicom-cdr-import'
 import { logger } from '../utils/logger'
 import { createClient } from '@supabase/supabase-js'
 import axios from 'axios'
@@ -133,14 +134,13 @@ router.post('/import-cdrs', async (req, res) => {
     const tenantId = sync.bicom_tenant_id
     const orgId    = (sync as any).soniq_org_id
 
-    if (!sUrl || !sKey) return res.status(400).json({ error: 'No server credentials linked to this tenant sync' })
+    if (!sUrl || !sKey) return res.status(400).json({ error: 'No server credentials linked', debug: { server_id: sync.server_id, bicom_servers: (sync as any).bicom_servers } })
     if (!tenantId)      return res.status(400).json({ error: 'bicom_tenant_id missing on sync row' })
     if (!orgId)         return res.status(400).json({ error: 'soniq_org_id missing on sync row' })
 
-    // Respond immediately, run in background
+    // Respond immediately — import runs in background
     res.json({ ok: true, status: 'importing', tenant_sync_id, months_back, dry_run })
 
-    const { importBicomCdrs } = await import('../services/bicom-cdr-import')
     importBicomCdrs({ tenant_sync_id, server_url: sUrl, api_key: sKey, bicom_tenant_id: tenantId, soniq_org_id: orgId, months_back, dry_run })
       .then(r => logger.info(`[CDR] Import complete: ${JSON.stringify(r)}`))
       .catch(e => logger.error(`[CDR] Import error: ${e.message}`))
