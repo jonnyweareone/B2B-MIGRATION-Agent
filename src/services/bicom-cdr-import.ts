@@ -6,9 +6,9 @@ export interface CdrImportParams {
   tenant_sync_id: string
   server_url: string
   api_key: string
-  bicom_tenant_id: string   // BiCom server/tenant numeric ID e.g. "578"
+  bicom_tenant_id: string
   soniq_org_id: string
-  months_back?: number      // default 12
+  months_back?: number
   dry_run?: boolean
 }
 
@@ -49,7 +49,7 @@ async function fetchCdrPage(
   startStr: string,
   endStr: string,
   page: number,
-): Promise<{ rows: string[][], headers: string[], hasMore: boolean }> {
+): Promise<{ rows: any[][], headers: string[], hasMore: boolean }> {
   const r = await axios.get(`${serverUrl.replace(/\/$/, '')}/index.php`, {
     params: {
       apikey:    apiKey,
@@ -59,7 +59,7 @@ async function fetchCdrPage(
       starttime: '00:00:00',
       end:       endStr,
       endtime:   '23:59:59',
-      limit:     1000,           // BiCom supports up to 1000/page
+      limit:     1000,
       page,
     },
     timeout: 60000,
@@ -90,15 +90,12 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
 
   logger.info(`[CDR] ${bicom_tenant_id} → org ${soniq_org_id} | ${startStr}→${endStr} | dry_run=${dry_run}`)
 
-  // Mark in_progress
   await sb.from('bicom_tenant_sync').update({
     cdr_import_status:     'in_progress',
     cdr_import_started_at: new Date().toISOString(),
   }).eq('id', tenant_sync_id)
 
-  let totalFetched  = 0
-  let totalInserted = 0
-  let totalSkipped  = 0
+  let totalFetched = 0
   let pageNum = 1
   let hasMore = true
   let headers: string[] = []
@@ -110,11 +107,9 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
       )
       if (pageNum === 1) headers = h
       hasMore = more
-
       if (rows.length === 0) break
       totalFetched += rows.length
 
-      // Build header → index map
       const idx = (name: string) => headers.indexOf(name)
       const iFrom      = idx('From')
       const iTo        = idx('To')
@@ -132,12 +127,21 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
           const unixTs       = parseInt(String(row[iDateTime] || '0'))
           const startedAt    = unixTs > 0 ? new Date(unixTs * 1000).toISOString() : null
           const durationSecs = parseInt(String(row[iDuration] || '0'))
-          const status       = STATUS_MAP[row[iStatus]] || 'unknown'
-          const direction    = DIRECTION_MAP[row[iType]] || 'inbound'
+          const status       = STATUS_MAP[String(row[iStatus])] || 'unknown'
+          const direction    = DIRECTION_MAP[String(row[iType])] || 'inbound'
           const mosRaw       = row[iMos]
           const mos          = mosRaw !== '' && mosRaw != null ? parseFloat(String(mosRaw)) : null
-          const endedAt      = startedAt && durationSecs > 0
-            ? new Date(new Date(startedAt).getTime() + durationSecs * 1000).toISOString()
+
+          // duration_seconds + ring_duration_seconds are GENERATED columns — never insert them.
+          // duration_seconds = ended_at - answered_at
+          // ring_duration_seconds = answered_at - started_at
+          // For BiCom: Total Duration = talk time (from answer). So:
+          //   answered_at = started_at  (ring time not available from BiCom CDR)
+          //   ended_at    = answered_at + duration
+          const answered  = status === 'completed' && durationSecs > 0
+          const answeredAt = answered && startedAt ? startedAt : null
+          const endedAt    = answeredAt
+            ? new Date(new Date(answeredAt).getTime() + durationSecs * 1000).toISOString()
             : null
 
           return {
@@ -150,46 +154,35 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
             caller_number:       String(row[iFrom] || ''),
             callee_number:       String(row[iTo]   || ''),
             started_at:          startedAt,
+            answered_at:         answeredAt,
             ended_at:            endedAt,
-            duration_seconds:    durationSecs || null,
             mos_score:           mos,
-            recording_available: row[iRecording] === 'True',
+            recording_available: String(row[iRecording]) === 'True',
           }
         })
 
-        // Upsert in batches of 200 — on conflict (duplicate source_id) do nothing
+        // Upsert in batches of 200
         for (let i = 0; i < records.length; i += 200) {
           const batch = records.slice(i, i + 200)
           const { error } = await sb
             .from('call_logs')
             .upsert(batch, { onConflict: 'org_id,source_id', ignoreDuplicates: true })
-
-          if (error) {
-            logger.warn(`[CDR] Batch error page ${pageNum}: ${error.message}`)
-          }
-          // Note: ignoreDuplicates suppresses returned rows — we get final count via DB query below
+          if (error) logger.warn(`[CDR] Batch error page ${pageNum} batch ${i}: ${error.message}`)
         }
-      } else {
-        totalInserted += rows.length
       }
 
-      logger.info(`[CDR] Page ${pageNum}: ${rows.length} rows | total ${totalFetched} fetched`)
+      logger.info(`[CDR] Page ${pageNum}: ${rows.length} rows | total fetched: ${totalFetched}`)
       pageNum++
-
-      // Safety cap
-      if (pageNum > 200) {
-        logger.warn('[CDR] Safety cap: 200 pages (200k records) reached')
-        hasMore = false
-      }
+      if (pageNum > 200) { logger.warn('[CDR] Safety cap: 200 pages reached'); hasMore = false }
     }
 
-    // Get actual inserted count from DB
+    // Get actual count from DB (ignoreDuplicates suppresses return rows)
     const { count } = await sb
       .from('call_logs')
       .select('*', { count: 'exact', head: true })
       .eq('org_id', soniq_org_id)
       .eq('source', 'bicom_import')
-    totalInserted = count ?? totalFetched
+    const totalInserted = count ?? 0
 
     await sb.from('bicom_tenant_sync').update({
       cdr_import_status:       'complete',
@@ -199,12 +192,12 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
       cdr_import_completed_at: new Date().toISOString(),
     }).eq('id', tenant_sync_id)
 
-    logger.info(`[CDR] Done: ${totalInserted} inserted, ${totalSkipped} skipped, ${pageNum - 1} pages`)
+    logger.info(`[CDR] Done: ${totalInserted} in DB, ${totalFetched} fetched, ${pageNum - 1} pages`)
     return {
       status: 'complete',
       total_fetched: totalFetched,
       total_inserted: totalInserted,
-      total_skipped: totalSkipped,
+      total_skipped: Math.max(0, totalFetched - totalInserted),
       date_from: dateFrom.toISOString(),
       date_to: dateTo.toISOString(),
       pages: pageNum - 1,
@@ -218,8 +211,8 @@ export async function importBicomCdrs(params: CdrImportParams): Promise<CdrImpor
     return {
       status: 'error',
       total_fetched: totalFetched,
-      total_inserted: totalInserted,
-      total_skipped: totalSkipped,
+      total_inserted: 0,
+      total_skipped: 0,
       date_from: dateFrom.toISOString(),
       date_to: dateTo.toISOString(),
       pages: pageNum - 1,
