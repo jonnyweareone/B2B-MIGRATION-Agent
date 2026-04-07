@@ -153,14 +153,11 @@ router.post('/import-cdrs', async (req, res) => {
     if (!orgId)         return res.status(400).json({ error: 'soniq_org_id missing on sync row' })
 
     // Run synchronously so Railway doesn't kill the process before completion
-    // (fire-and-forget was failing silently on Railway)
     const result = await importBicomCdrs({ tenant_sync_id, server_url: sUrl, api_key: sKey, bicom_tenant_id: tenantId, soniq_org_id: orgId, months_back, dry_run })
+    logger.info(`[CDR] Import complete: ${JSON.stringify(result)}`)
     res.json({ ok: true, status: result.status, ...result })
-      .then(r => logger.info(`[CDR] Import complete: ${JSON.stringify(r)}`))
-      .catch(e => logger.error(`[CDR] Import error: ${e.message}`))
 
   } catch (e: any) { res.status(500).json({ error: e.message }) }
 })
 
 export default router
-// Tue Apr  7 23:40:29 BST 2026
