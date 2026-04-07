@@ -114,6 +114,20 @@ router.post('/capture-greetings', async (req: Request, res: Response) => {
   } catch (e: any) { res.status(500).json({ error: e.message }) }
 })
 
+// ─── CDR fetch probe — synchronous, returns raw BiCom response ────────────────
+router.get('/cdr-probe', async (req, res) => {
+  try {
+    const server_url = String(req.query.server_url || 'https://mt001.valuecomms.co.uk')
+    const api_key    = String(req.query.api_key    || 'EQH4hSV8NH8U3pvB0wqOIufVFYB3s3hN')
+    const server     = String(req.query.server     || '578')
+    const r = await axios.get(`${server_url.replace(/\/$/, '')}/index.php`, {
+      params: { apikey: api_key, action: 'pbxware.cdr.download.csv', server, start: 'Apr-01-2026', starttime: '00:00:00', end: 'Apr-07-2026', endtime: '23:59:59', limit: 5, page: 1 },
+      timeout: 15000,
+    })
+    res.json({ ok: true, status: r.status, keys: Object.keys(r.data || {}), records: r.data?.records, next_page: r.data?.next_page, first_row: r.data?.csv?.[0] || null, error: r.data?.error || null })
+  } catch (e: any) { res.status(500).json({ error: e.message, code: e.code }) }
+})
+
 // ─── CDR History Import ────────────────────────────────────────────────────
 router.post('/import-cdrs', async (req, res) => {
   try {
