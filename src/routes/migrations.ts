@@ -21,11 +21,24 @@ router.use(verifyApiKey);
 // Start migration
 router.post('/start', async (req, res) => {
   try {
-    const { orgId, accessToken, provider } = req.body;
+    const {
+      orgId,
+      accessToken,
+      provider,
+      syncMode = 'directory_only',
+      msTenantId,
+      tenantSyncJobId,
+    } = req.body;
 
     if (!orgId || !accessToken || !provider) {
       return res.status(400).json({
         error: 'Missing required fields: orgId, accessToken, provider',
+      });
+    }
+
+    if (syncMode && !['directory_only', 'full'].includes(syncMode)) {
+      return res.status(400).json({
+        error: "syncMode must be 'directory_only' or 'full'",
       });
     }
 
@@ -53,6 +66,9 @@ router.post('/start', async (req, res) => {
       orgId,
       accessToken,
       provider,
+      syncMode,
+      msTenantId,
+      tenantSyncJobId,
     });
 
     logger.info(`🚀 Started migration job ${migrationJob.id}`, {
@@ -60,12 +76,14 @@ router.post('/start', async (req, res) => {
       bullJobId: job.id,
       orgId,
       provider,
+      syncMode,
     });
 
     res.json({
       migrationJobId: migrationJob.id,
       bullJobId: job.id,
       status: 'started',
+      syncMode,
     });
   } catch (error) {
     logger.error('Error starting migration:', error);

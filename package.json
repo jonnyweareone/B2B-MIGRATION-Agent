@@ -20,6 +20,7 @@
   "author": "Guardian Network Solutions",
   "license": "PROPRIETARY",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1037.0",
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "@supabase/supabase-js": "^2.39.3",
     "axios": "^1.14.0",
